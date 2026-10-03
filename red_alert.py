@@ -59,6 +59,9 @@ MAX_BODY = 64 * 1024
 MAX_MESSAGE = 500
 HARD_CAP_SECONDS = 300  # no alert sounds longer than this
 MIN_LOOP_SECONDS = 0.05  # a play shorter than this ends a loop (an empty file)
+FETCH_SECONDS = 15  # an alert whose sound is not downloaded by then fails
+PREFETCH_SECONDS = 120
+MAX_MUTE_MINUTES = 365 * 24 * 60
 
 log = logging.getLogger("red-alert")
 
@@ -135,7 +138,9 @@ def is_url(source: str) -> bool:
 
 def _number(table: dict, key: str, default, where: str, lo=None, hi=None, kind=int):
     value = table.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (
+        isinstance(value, float) and not math.isfinite(value)
+    ):
         raise ConfigError(f"{where}.{key} must be a number")
     value = kind(value)
     if (lo is not None and value < lo) or (hi is not None and value > hi):
@@ -143,14 +148,26 @@ def _number(table: dict, key: str, default, where: str, lo=None, hi=None, kind=i
     return value
 
 
+def _table(raw: dict, key: str) -> dict:
+    value = raw.get(key, {})
+    if not isinstance(value, dict):
+        raise ConfigError(f"[{key}] must be a table")
+    return value
+
+
 def parse_config(raw: dict, path: Path | None) -> Config:
-    server = raw.get("server", {})
-    audio = raw.get("audio", {})
+    server = _table(raw, "server")
+    audio = _table(raw, "audio")
     base = path.parent if path else Path.cwd()
 
+    items = raw.get("levels", [])
+    if not isinstance(items, list):
+        raise ConfigError("levels must be [[levels]] tables")
     levels: list[Level] = []
-    for index, item in enumerate(raw.get("levels", [])):
+    for index, item in enumerate(items):
         where = f"levels[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{where} must be a table")
         name = str(item.get("name", "")).strip().lower()
         if not LEVEL_NAME.match(name):
             raise ConfigError(f"{where}.name {name!r} must match {LEVEL_NAME.pattern}")
@@ -207,6 +224,7 @@ def parse_config(raw: dict, path: Path | None) -> Config:
     player = audio.get("player", "auto")
     if not isinstance(player, str):
         raise ConfigError("audio.player must be a string")
+    Player(player)  # an unknown player is a config error, not a crash at startup
     cache_dir = Path(os.path.expanduser(str(audio.get("cache_dir", CACHE_DIR))))
     token = server.get("token", "")
     if not isinstance(token, str):
@@ -233,6 +251,8 @@ def load_config(path: Path | None = None) -> Config:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ConfigError(f"config file not found: {path}") from None
+    except (OSError, UnicodeDecodeError) as err:
+        raise ConfigError(f"cannot read {path}: {err}") from None
     except tomllib.TOMLDecodeError as err:
         raise ConfigError(f"{path}: {err}") from None
     return parse_config(raw, path)
@@ -262,7 +282,12 @@ class SoundCache:
         path = self.path_for(source)
         return path.is_file() and path.stat().st_size > 0
 
-    def fetch(self, source: str, timeout: float = 30) -> Path:
+    def fetch(self, source: str, timeout: float = 30, deadline: float | None = None) -> Path:
+        """The local file for `source`, downloading a URL not cached yet.
+
+        `timeout` bounds each network wait; `deadline` (a time.monotonic()
+        value) the whole download, including waiting on another download of it.
+        """
         path = self.path_for(source)
         if self.is_ready(source):
             return path
@@ -270,11 +295,16 @@ class SoundCache:
             raise FileNotFoundError(f"sound file not found: {path}")
         with self._guard:
             lock = self._locks.setdefault(source, threading.Lock())
-        with lock:
+        if not lock.acquire(timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("still downloading it")
+        try:
             if self.is_ready(source):
                 return path
             self.dir.mkdir(parents=True, exist_ok=True)
-            partial = path.with_name(path.name + ".part")
+            # Its own name: a cache from before a reload may download it at the same time.
+            partial = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.part")
+            if deadline is not None:
+                timeout = max(0.1, min(timeout, deadline - time.monotonic()))
             request = urllib.request.Request(
                 source, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
             )
@@ -284,12 +314,17 @@ class SoundCache:
                     if kind.startswith("text/"):
                         raise ValueError(f"server sent {kind}, not audio")
                     with open(partial, "wb") as out:
-                        shutil.copyfileobj(response, out)
+                        while chunk := response.read1(64 * 1024):  # what has come, so the deadline holds
+                            if deadline is not None and time.monotonic() > deadline:
+                                raise TimeoutError("download too slow")
+                            out.write(chunk)
                 os.replace(partial, path)
             finally:
                 partial.unlink(missing_ok=True)
             log.info("cached %s -> %s", source, path)
             return path
+        finally:
+            lock.release()
 
 
 def _volume_scale(volume: int, full: int) -> str:
@@ -349,12 +384,33 @@ class Player:
         return PLAYERS[player](str(path), volume)
 
 
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signals a player and anything it started: it leads its own process group."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _end(proc: subprocess.Popen) -> None:
+    """Stops a player and its children, without waiting long for them."""
+    _signal_group(proc, signal.SIGTERM)
+    try:
+        proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc, signal.SIGKILL)
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass  # something left the group and holds its stderr: let it go
+
+
 class _Job:
-    def __init__(self, alert_id: str, level: Level, path: Path, duration: float):
+    def __init__(self, alert_id: str, level: Level, duration: float, fetch):
         self.alert_id = alert_id
         self.level = level
-        self.path = path
         self.duration = duration
+        self.fetch = fetch  # () -> Path: the sound file, downloaded if need be
         self.stop = threading.Event()
         self.reason: str | None = None
         self.proc: subprocess.Popen | None = None
@@ -373,82 +429,96 @@ class Playback:
         with self._lock:
             return self._current
 
-    def start(self, alert_id: str, level: Level, path: Path, duration: float) -> None:
-        job = _Job(alert_id, level, path, duration)
+    def start(self, alert_id: str, level: Level, duration: float, fetch) -> None:
+        """Plays an alert, taking the speaker from the one playing; `fetch` gives its sound file."""
+        job = _Job(alert_id, level, duration, fetch)
         with self._lock:
             previous, self._current = self._current, job
+            if previous:
+                self._mark(previous, "preempted")
         if previous:
-            self._halt(previous, "preempted")
+            self._kill(previous)
+            self.on_done(previous.alert_id, previous.reason, None)  # now, though it may be downloading still
         threading.Thread(target=self._run, args=(job,), name=f"play-{alert_id}", daemon=True).start()
 
     def stop(self, alert_id: str | None = None) -> str | None:
         with self._lock:
             job = self._current
-        if job is None or (alert_id and job.alert_id != alert_id):
-            return None
-        self._halt(job, "stopped")
+            if job is None or (alert_id and job.alert_id != alert_id):
+                return None
+            self._current = None  # the speaker is free now, not once the player exits
+            self._mark(job, "stopped")
+        self._kill(job)
+        self.on_done(job.alert_id, job.reason, None)
         return job.alert_id
 
     @staticmethod
-    def _halt(job: _Job, reason: str) -> None:
+    def _mark(job: _Job, reason: str) -> None:
         job.reason = job.reason or reason
         job.stop.set()
+
+    @staticmethod
+    def _kill(job: _Job) -> None:
         proc = job.proc
-        if proc and proc.poll() is None:
-            proc.terminate()
+        if proc:
+            _signal_group(proc, signal.SIGTERM)
 
     def _run(self, job: _Job) -> None:
-        """Plays the sound once, or loops it until `duration` runs out, cutting the last play."""
-        status, detail = "played", None
-        start = time.monotonic()
-        deadline = start + (job.duration or HARD_CAP_SECONDS)
         try:
-            while not job.stop.is_set() and time.monotonic() < deadline:
-                began = time.monotonic()
-                ok, detail = self._play_once(job, deadline)
-                if not ok:
-                    status = "failed"
-                    break
-                if not job.duration or time.monotonic() - began < MIN_LOOP_SECONDS:
-                    break
+            status, detail = self._play(job)
         except Exception as err:  # never let a playback thread die silently
             status, detail = "failed", str(err)
-        finally:
-            with self._lock:
-                if self._current is job:
-                    self._current = None
+        with self._lock:
+            if self._current is job:
+                self._current = None
             if job.stop.is_set():
                 status = job.reason or "stopped"
-            self.on_done(job.alert_id, status, detail)
+        self.on_done(job.alert_id, status, detail)
 
-    def _play_once(self, job: _Job, deadline: float) -> tuple[bool, str | None]:
+    def _play(self, job: _Job) -> tuple[str, str | None]:
+        """Fetches the sound, then plays it once, or loops it until `duration` runs out, cutting the last play."""
+        try:
+            path = job.fetch()
+        except Exception as err:
+            return "failed", f"sound unavailable: {err}"
+        deadline = time.monotonic() + (job.duration or HARD_CAP_SECONDS)
+        while not job.stop.is_set() and time.monotonic() < deadline:
+            began = time.monotonic()
+            ok, detail = self._play_once(job, path, deadline)
+            if not ok:
+                return "failed", detail
+            if not job.duration or time.monotonic() - began < MIN_LOOP_SECONDS:
+                break
+        return "played", None
+
+    def _play_once(self, job: _Job, path: Path, deadline: float) -> tuple[bool, str | None]:
         errors = []
-        for player in self.player.order(job.path):
+        for player in self.player.order(path):
             if job.stop.is_set():
                 return True, None
-            argv = self.player.argv(player, job.path, job.level.volume)
+            argv = self.player.argv(player, path, job.level.volume)
             try:
+                # its own process group, so a stop reaches whatever a wrapper command starts
                 proc = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    start_new_session=True,
                 )
             except OSError as err:
                 errors.append(f"{player}: {err}")
                 continue
             job.proc = proc
-            if job.stop.is_set():
-                proc.terminate()
             try:
-                _, stderr = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:  # duration reached: cut the sound
-                proc.terminate()
+                if job.stop.is_set():
+                    _signal_group(proc, signal.SIGTERM)
                 try:
-                    proc.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-                return True, None
+                    _, stderr = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:  # duration reached: cut the sound
+                    _end(proc)
+                    return True, None
+            finally:
+                job.proc = None
             if proc.returncode == 0 or job.stop.is_set():
-                self.player.working[job.path.suffix.lower()] = player
+                self.player.working[path.suffix.lower()] = player
                 return True, None
             message = stderr.decode(errors="replace").strip().splitlines()
             errors.append(f"{player} exited {proc.returncode}: {message[-1] if message else ''}")
@@ -494,14 +564,16 @@ class AlertSystem:
     # -- configuration -----------------------------------------------------
 
     def reload(self) -> Config:
-        config = load_config(self.config.path)
+        # Started on the bundled example: a config.toml written since takes over.
+        config = load_config(None if self.config.path == EXAMPLE_CONFIG else self.config.path)
         player = Player(config.player)
         with self._lock:
             if (config.host, config.port) != (self.config.host, self.config.port):
                 log.warning("server.host/port changed: restart the service to apply it")
+            if config.cache_dir != self.config.cache_dir:
+                self.sounds = SoundCache(config.cache_dir)
             self.config = config
             self.player = self.playback.player = player
-            self.sounds = SoundCache(config.cache_dir)
             self.history = deque(self.history, maxlen=config.history_size)
         self.prefetch()
         log.info("config reloaded: levels %s", ", ".join(l.name for l in config.levels))
@@ -513,7 +585,7 @@ class AlertSystem:
         def run() -> None:
             for level in levels:
                 try:
-                    sounds.fetch(level.sound)
+                    sounds.fetch(level.sound, deadline=time.monotonic() + PREFETCH_SECONDS)
                 except Exception as err:
                     log.warning("level %s: cannot fetch %s: %s", level.name, level.sound, err)
 
@@ -539,9 +611,10 @@ class AlertSystem:
             self.mute_until = None
 
     def mute_state(self) -> dict | None:
-        if not self.is_muted():
-            return None
-        until = self.mute_until
+        with self._lock:
+            if not self.is_muted():
+                return None
+            until = self.mute_until
         return {"until": None if until is None or math.isinf(until) else until}
 
     def levels_public(self) -> list[dict]:
@@ -551,7 +624,7 @@ class AlertSystem:
         public = [level.public(False) for level in self.config.levels]
         return hashlib.sha256(json.dumps(public, sort_keys=True).encode()).hexdigest()[:12]
 
-    def health(self) -> dict:
+    def health(self, include_last: bool = True) -> dict:
         now = time.time()
         job = self.playback.current()
         with self._lock:
@@ -568,7 +641,7 @@ class AlertSystem:
             "levels_hash": self.levels_hash(),
             "playing": {"id": job.alert_id, "level": job.level.name} if job else None,
             "mute": self.mute_state(),
-            "last_alert": last,
+            "last_alert": last if include_last else None,
         }
 
     def recent(self, limit: int) -> list[dict]:
@@ -604,8 +677,15 @@ class AlertSystem:
             "status": "playing",
             "detail": None,
         }
-        current = self.playback.current()
+        sounds = self.sounds
+
+        def fetch() -> Path:
+            return sounds.fetch(level.sound, timeout=10, deadline=time.monotonic() + FETCH_SECONDS)
+
+        # Decided and started under one lock, so no other alert slips in between;
+        # a sound still to download is fetched by the playback thread.
         with self._lock:
+            current = self.playback.current()
             if self.is_muted(now):
                 alert["status"] = "muted"
             elif now - self.last_sounded.get(level.name, -math.inf) < level.cooldown_seconds:
@@ -613,17 +693,13 @@ class AlertSystem:
             elif current and current.level.priority > level.priority:
                 alert["status"] = "suppressed"
                 alert["detail"] = f"a {current.level.name} alert is playing"
-            else:
-                self.last_sounded[level.name] = now
+            elif not is_url(level.sound) and not sounds.is_ready(level.sound):
+                alert["status"] = "failed"
+                alert["detail"] = f"sound unavailable: sound file not found: {level.sound}"
             self.history.append(alert)
-
-        if alert["status"] == "playing":
-            try:
-                path = self.sounds.fetch(level.sound, timeout=10)
-            except Exception as err:
-                self._finished(alert["id"], "failed", f"sound unavailable: {err}")
-            else:
-                self.playback.start(alert["id"], level, path, duration)
+            if alert["status"] == "playing":
+                self.last_sounded[level.name] = now
+                self.playback.start(alert["id"], level, duration, fetch)
         if level.notify and alert["status"] != "cooldown":
             desktop_notify(level, alert["title"], alert["message"] or alert["title"])
 
@@ -640,6 +716,9 @@ class AlertSystem:
                 if alert["id"] == alert_id:
                     alert["status"] = status
                     alert["detail"] = detail
+                    # it made no sound, so it does not start the level's cooldown
+                    if status == "failed" and self.last_sounded.get(alert["level"]) == alert["time"]:
+                        del self.last_sounded[alert["level"]]
                     break
         if status == "failed":
             log.error("alert %s failed to play: %s", alert_id, detail)
@@ -657,11 +736,28 @@ class ApiError(Exception):
         self.extra = extra
 
 
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is out of range")
+    return value
+
+
+def _no_constant(name: str):
+    raise ValueError(f"{name} is not JSON")
+
+
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host else host
+
+
 class AlertServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, address, system: AlertSystem):
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, Handler)
         self.system = system
 
@@ -670,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
     server: AlertServer
     server_version = f"red-alert/{VERSION}"
     protocol_version = "HTTP/1.1"
+    timeout = 30  # an idle or stalled connection gives its thread back
+    _body_pending = False
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002 (stdlib name)
         log.debug("%s %s", self.address_string(), format % args)
@@ -677,20 +775,24 @@ class Handler(BaseHTTPRequestHandler):
     # -- plumbing ------------------------------------------------------------
 
     def _reply(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload).encode()
+        body = json.dumps(payload, allow_nan=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self._body_pending:
+            # A body left unread would be parsed as the next request on this connection.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
-    def _require_token(self) -> None:
+    def _has_token(self) -> bool:
         token = self.server.system.config.token
-        if not token:
-            return
         given = self.headers.get("Authorization", "")
-        if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
+        return not token or hmac.compare_digest(given.encode(), f"Bearer {token}".encode())
+
+    def _require_token(self) -> None:
+        if not self._has_token():
             raise ApiError(401, "missing or wrong bearer token")
 
     def _json_body(self) -> dict:
@@ -701,21 +803,32 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "requests from web pages are not accepted")
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             raise ApiError(415, "send Content-Type: application/json")
-        length = int(self.headers.get("Content-Length") or 0)
+        if "Transfer-Encoding" in self.headers:
+            raise ApiError(411, "send the body with a Content-Length")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            raise ApiError(400, "bad Content-Length")
         if length > MAX_BODY:
             raise ApiError(413, "body too large")
         raw = self.rfile.read(length) if length else b""
+        self._body_pending = False
         if not raw.strip():
             return {}
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+            data = json.loads(raw, parse_float=_finite, parse_constant=_no_constant)
+        except ValueError:  # also bad UTF-8, NaN and Infinity
             raise ApiError(400, "body is not valid JSON") from None
         if not isinstance(data, dict):
             raise ApiError(400, "body must be a JSON object")
         return data
 
     def _handle(self, routes: dict) -> None:
+        self._body_pending = "Transfer-Encoding" in self.headers or (
+            self.headers.get("Content-Length") or "0"
+        ).strip() != "0"
         path, _, query = self.path.partition("?")
         route = routes.get(path.rstrip("/") or "/")
         try:
@@ -744,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
         self._handle(
             {
                 "/": lambda q: {"ok": True, "service": "red-alert", "version": VERSION},
-                "/health": lambda q: system.health(),
+                "/health": lambda q: system.health(include_last=self._has_token()),
                 "/levels": lambda q: {"ok": True, "levels": system.levels_public()},
                 "/history": history,
             }
@@ -797,8 +910,14 @@ class Handler(BaseHTTPRequestHandler):
 
         def mute(_: dict) -> dict:
             minutes = body().get("minutes", 30)
-            if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes < 0:
-                raise ApiError(400, "minutes must be a number >= 0 (0 mutes until unmuted)")
+            if (
+                isinstance(minutes, bool)
+                or not isinstance(minutes, (int, float))
+                or not 0 <= minutes <= MAX_MUTE_MINUTES
+            ):
+                raise ApiError(
+                    400, f"minutes must be a number from 0 to {MAX_MUTE_MINUTES} (0 mutes until unmuted)"
+                )
             return {"ok": True, "mute": system.mute(float(minutes))}
 
         def unmute(_: dict) -> dict:
@@ -824,17 +943,20 @@ def serve(args: argparse.Namespace) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+    # A reload (SIGHUP) that comes while starting up waits for the daemon instead of killing it.
+    early_hup = threading.Event()
+    signal.signal(signal.SIGHUP, lambda *_: early_hup.set())
     try:
         config = load_config(args.config)
+        system = AlertSystem(config)
     except ConfigError as err:
         log.error("%s", err)
         return 2
-    system = AlertSystem(config)
     host, port = args.host or config.host, args.port or config.port
     try:
         server = AlertServer((host, port), system)
     except OSError as err:
-        log.error("cannot listen on %s:%d: %s", host, port, err)
+        log.error("cannot listen on %s:%d: %s", _url_host(host), port, err)
         return 1
 
     def on_hup(*_) -> None:
@@ -853,9 +975,11 @@ def serve(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGHUP, on_hup)
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
+    if early_hup.is_set():
+        on_hup()
     log.info(
         "red-alert %s listening on http://%s:%d (config %s, player %s, levels %s)",
-        VERSION, host, port, config.path, system.player.describe(),
+        VERSION, _url_host(host), port, config.path, system.player.describe(),
         ", ".join(level.name for level in config.levels),
     )
     if host not in ("127.0.0.1", "localhost", "::1") and not config.token:
@@ -926,7 +1050,7 @@ def client_from_args(args: argparse.Namespace) -> Client:
             config = None
         if config and not url:
             host = "127.0.0.1" if config.host in ("0.0.0.0", "::", "") else config.host
-            url = f"http://{host}:{config.port}"
+            url = f"http://{_url_host(host)}:{config.port}"
         if config and not token:
             token = config.token
     return Client(url or f"http://{DEFAULT_HOST}:{DEFAULT_PORT}", token)

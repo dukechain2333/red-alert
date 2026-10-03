@@ -75,7 +75,7 @@ else
   install -m 0644 "$REPO/config.example.toml" "$CONFIG_DIR/config.toml"
   say "wrote the default config: $CONFIG_DIR/config.toml"
 fi
-"$PYTHON" -c "import sys; sys.path.insert(0, '$PREFIX'); import red_alert; red_alert.load_config()" \
+"$PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); import red_alert; red_alert.load_config()' "$PREFIX" \
   || die "the config does not load; fix $CONFIG_DIR/config.toml and run this again"
 
 player=""
@@ -97,11 +97,12 @@ if [ "$with_service" = 1 ]; then
   systemctl --user restart red-alert.service
   say "service enabled and started: systemctl --user status red-alert"
 
-  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != "yes" ]; then
-    if loginctl enable-linger "$USER" 2>/dev/null; then
+  user="${USER:-$(id -un)}"
+  if [ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != "yes" ]; then
+    if loginctl enable-linger "$user" 2>/dev/null; then
       say "enabled lingering: the service now starts at boot, before anyone logs in"
     else
-      warn "could not enable lingering; to start at boot run: sudo loginctl enable-linger $USER"
+      warn "could not enable lingering; to start at boot run: sudo loginctl enable-linger $user"
     fi
   fi
 
