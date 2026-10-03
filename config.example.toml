@@ -62,6 +62,7 @@ sound = "https://www.trekcore.com/audio/computer/alert09.mp3"
 style = "pulse"
 color = "#FFCC33"
 volume = 90
+duration = 4.7          # plays twice: each play takes ~2.5 s, the last 0.5 s of it silence
 cooldown_seconds = 10
 description = """
 A significant body of work is complete and ready for review: a multi-step \

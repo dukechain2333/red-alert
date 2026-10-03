@@ -38,7 +38,7 @@ online and animates every alert in the terminal.
 | Level | Sound | Sounds for | Claude uses it when… |
 | --- | --- | --- | --- |
 | `normal` | [TNG communicator chirp](https://www.trekcore.com/audio/communicator/tng_chirp_clean.mp3) | once (0.5 s) | a small milestone or FYI: a long build or test run finished, a progress checkpoint |
-| `yellow` | [computer alert](https://www.trekcore.com/audio/computer/alert09.mp3) | once (2.3 s) | a significant body of work is complete and ready for review |
+| `yellow` | [computer alert](https://www.trekcore.com/audio/computer/alert09.mp3) | twice (4.7 s) | a significant body of work is complete and ready for review |
 | `red` | [TNG red alert klaxon](https://www.trekcore.com/audio/redalertandklaxons/tng_red_alert1.mp3) | 12 s (of 21 s) | it is blocked, needs a decision, credentials or approval, or something failed badly |
 
 ## Requirements
