@@ -90,9 +90,9 @@ Start a new Claude Code session after installing. Then:
 
 - **Claude raises alerts by itself.** The mod adds the
   `mcp__red-alert__alert` tool and a short system-prompt note: Claude calls
-  it once, as the last step of a turn that did substantial work, or right
-  before it stops to ask you something. It skips quick back-and-forth while
-  you are at the keyboard. To change how often it alerts, tell it ("only red
+  it once, as the last step of a turn where one of the levels fits, or right
+  before it stops to ask you something, whether or not you seem to be at the
+  keyboard. To change how often it alerts, tell it ("only red
   alerts today", "no alerts for this task") or edit the level descriptions.
   The tool never asks for permission, since all it does is play a sound on
   your own machine.
@@ -245,7 +245,6 @@ before you stop to ask me something, run exactly one of:
 - `red-alert send normal "<what finished>"`: small milestone or FYI
 - `red-alert send yellow "<summary>"`: a big task is done and ready for review
 - `red-alert send red "<what you need>"`: you are blocked and need me now
-Skip it for quick back-and-forth while I'm at the keyboard.
 ```
 
 ## Claude Code on another machine

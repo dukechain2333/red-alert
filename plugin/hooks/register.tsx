@@ -52,7 +52,7 @@ const FALLBACK_LEVELS: AlertLevel[] = [
 ]
 
 const POLICY = `# Audible alerts
-The user runs red-alert: the \`${TOOL}\` tool plays a sound through this machine's speakers and flashes a banner in Claude Code, so the user can step away while you work. Decide on your own when to use it and at which level, following the levels in the tool's description: usually once, as your last action before you end a turn that did substantial work, or right before you stop to wait for the user. Skip it for quick back-and-forth while the user is clearly at the keyboard.`
+The user runs red-alert: the \`${TOOL}\` tool plays a sound through this machine's speakers and flashes a banner in Claude Code, so the user can step away while you work. Decide on your own when to use it and at which level, following the levels in the tool's description: once, as your last action before you end a turn where a level fits, or right before you stop to wait for the user. Alert whether or not the user seems to be at the keyboard.`
 
 type Table = Elements[keyof Elements]
 
@@ -149,7 +149,7 @@ function toolDescription(list: readonly AlertLevel[]): string {
     '',
     'How to use it:',
     '- Call it at most once per turn, as the last thing you do before ending your turn, or right before you ask a question that blocks you. Pick the highest level that fits.',
-    '- Do not alert for quick conversational replies while the user is clearly at the keyboard, and never for each small step of a task.',
+    '- Alert whenever a level fits, whether or not the user seems to be at the keyboard. Never alert for each small step of a task.',
     '- If the user asks for fewer or no alerts, follow that for the rest of the session.',
     '- The result says whether the sound played. If the system is offline or muted, carry on; do not retry.',
   ].join('\n')

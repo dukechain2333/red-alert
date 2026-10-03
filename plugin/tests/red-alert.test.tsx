@@ -150,6 +150,7 @@ describe('the alert tool', () => {
     const tool = daemon.registered[daemon.registered.length - 1]
     expect(tool?.name).toBe('alert')
     expect(tool?.description).toContain('- red: blocked, need the user')
+    expect(tool?.description).toContain('whether or not the user seems to be at the keyboard')
     expect(JSON.stringify(tool?.inputSchema)).toContain('"enum":["normal","yellow","red"]')
 
     const ran = await $.tool.call({ tool: TOOL, level: 'red', message: 'Need your decision on the schema' })
