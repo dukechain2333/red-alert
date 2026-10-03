@@ -33,8 +33,9 @@ player = "auto"
 #                     (default from priority: >=80 klaxon, >=40 pulse, else sweep)
 #   color             #RRGGBB used by the mod and the CLI
 #   volume            0-100                                       (default 100)
-#   repeat            play the sound this many times              (default 1)
-#   max_seconds       cut the sound after this long, 0 = no limit (default 0)
+#   duration          how long the alert sounds, in seconds (up to 300): a
+#                     longer sound is cut there, a shorter one loops until
+#                     then; 0 plays the sound once, in full    (default 0)
 #   cooldown_seconds  ignore repeats of this level within N seconds (default 0)
 #   notify            also show a desktop notification  (default priority>=40)
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ sound = "https://www.trekcore.com/audio/redalertandklaxons/tng_red_alert1.mp3"
 style = "klaxon"
 color = "#FF3333"
 volume = 100
-max_seconds = 12
+duration = 12           # the klaxon file runs 21 s: cut it at 12
 description = """
 The user is needed now: you are blocked or stuck and cannot make progress \
 on your own; you need a decision, credentials, approval or information only \
@@ -88,6 +89,7 @@ waiting for confirmation. Raise it right before you stop to ask."""
 # name = "blue"
 # priority = 30
 # sound = "~/sounds/doorbell.wav"
+# duration = 6          # a 2 s doorbell rings three times
 # style = "sweep"
 # color = "#6699FF"
 # description = "A deployment or release finished successfully."

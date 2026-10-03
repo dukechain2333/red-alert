@@ -46,7 +46,7 @@ except ModuleNotFoundError:  # Python < 3.11
     except ModuleNotFoundError:
         tomllib = None  # type: ignore[assignment]
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PROJECT_URL = "https://github.com/dukechain2333/red-alert"
 USER_AGENT = f"red-alert/{VERSION} (+{PROJECT_URL})"
 DEFAULT_HOST = "127.0.0.1"
@@ -57,7 +57,8 @@ LEVEL_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_BODY = 64 * 1024
 MAX_MESSAGE = 500
-HARD_CAP_SECONDS = 300  # no single playback runs longer than this
+HARD_CAP_SECONDS = 300  # no alert sounds longer than this
+MIN_LOOP_SECONDS = 0.05  # a play shorter than this ends a loop (an empty file)
 
 log = logging.getLogger("red-alert")
 
@@ -89,8 +90,7 @@ class Level:
     color: str
     style: str
     volume: int
-    repeat: int
-    max_seconds: float
+    duration: float  # seconds: cut a longer sound, loop a shorter one; 0 = play once
     cooldown_seconds: float
     notify: bool
 
@@ -104,8 +104,7 @@ class Level:
             "sound": self.sound,
             "sound_ready": sound_ready,
             "volume": self.volume,
-            "repeat": self.repeat,
-            "max_seconds": self.max_seconds,
+            "duration": self.duration,
             "cooldown_seconds": self.cooldown_seconds,
             "notify": self.notify,
         }
@@ -158,6 +157,12 @@ def parse_config(raw: dict, path: Path | None) -> Config:
         if any(level.name == name for level in levels):
             raise ConfigError(f"{where}: duplicate level name {name!r}")
         where = f"level '{name}'"
+        for legacy in ("repeat", "max_seconds"):
+            if legacy in item:
+                raise ConfigError(
+                    f"{where}: `{legacy}` was replaced by `duration` (seconds: a longer "
+                    "sound is cut, a shorter one loops; 0 plays it once)"
+                )
 
         sound = item.get("sound")
         if not isinstance(sound, str) or not sound.strip():
@@ -190,8 +195,7 @@ def parse_config(raw: dict, path: Path | None) -> Config:
                 color=color.upper(),
                 style=style,
                 volume=_number(item, "volume", 100, where, 0, 100),
-                repeat=_number(item, "repeat", 1, where, 1, 20),
-                max_seconds=_number(item, "max_seconds", 0, where, 0, HARD_CAP_SECONDS, float),
+                duration=_number(item, "duration", 0, where, 0, HARD_CAP_SECONDS, float),
                 cooldown_seconds=_number(item, "cooldown_seconds", 0, where, 0, 86400, float),
                 notify=notify,
             )
@@ -346,10 +350,11 @@ class Player:
 
 
 class _Job:
-    def __init__(self, alert_id: str, level: Level, path: Path):
+    def __init__(self, alert_id: str, level: Level, path: Path, duration: float):
         self.alert_id = alert_id
         self.level = level
         self.path = path
+        self.duration = duration
         self.stop = threading.Event()
         self.reason: str | None = None
         self.proc: subprocess.Popen | None = None
@@ -368,8 +373,8 @@ class Playback:
         with self._lock:
             return self._current
 
-    def start(self, alert_id: str, level: Level, path: Path) -> None:
-        job = _Job(alert_id, level, path)
+    def start(self, alert_id: str, level: Level, path: Path, duration: float) -> None:
+        job = _Job(alert_id, level, path, duration)
         with self._lock:
             previous, self._current = self._current, job
         if previous:
@@ -393,16 +398,18 @@ class Playback:
             proc.terminate()
 
     def _run(self, job: _Job) -> None:
+        """Plays the sound once, or loops it until `duration` runs out, cutting the last play."""
         status, detail = "played", None
-        limit = job.level.max_seconds or HARD_CAP_SECONDS
-        deadline = time.monotonic() + limit
+        start = time.monotonic()
+        deadline = start + (job.duration or HARD_CAP_SECONDS)
         try:
-            for _ in range(job.level.repeat):
-                if job.stop.is_set() or time.monotonic() >= deadline:
-                    break
+            while not job.stop.is_set() and time.monotonic() < deadline:
+                began = time.monotonic()
                 ok, detail = self._play_once(job, deadline)
                 if not ok:
                     status = "failed"
+                    break
+                if not job.duration or time.monotonic() - began < MIN_LOOP_SECONDS:
                     break
         except Exception as err:  # never let a playback thread die silently
             status, detail = "failed", str(err)
@@ -432,7 +439,7 @@ class Playback:
                 proc.terminate()
             try:
                 _, stderr = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:  # max_seconds reached: cut the sound
+            except subprocess.TimeoutExpired:  # duration reached: cut the sound
                 proc.terminate()
                 try:
                     proc.communicate(timeout=2)
@@ -570,8 +577,18 @@ class AlertSystem:
 
     # -- alerts ------------------------------------------------------------
 
-    def sound(self, level_name: str, message: str = "", title: str = "", source: str = "") -> dict:
+    def sound(
+        self,
+        level_name: str,
+        message: str = "",
+        title: str = "",
+        source: str = "",
+        duration: float | None = None,
+    ) -> dict:
+        """Sounds `level`; `duration` overrides the level's own for this alert."""
         level = self.config.level(level_name)
+        if duration is None:
+            duration = level.duration
         now = time.time()
         alert = {
             "id": uuid.uuid4().hex[:12],
@@ -583,6 +600,7 @@ class AlertSystem:
             "message": message[:MAX_MESSAGE],
             "source": source[:120],
             "time": now,
+            "duration": duration,
             "status": "playing",
             "detail": None,
         }
@@ -605,7 +623,7 @@ class AlertSystem:
             except Exception as err:
                 self._finished(alert["id"], "failed", f"sound unavailable: {err}")
             else:
-                self.playback.start(alert["id"], level, path)
+                self.playback.start(alert["id"], level, path, duration)
         if level.notify and alert["status"] != "cooldown":
             desktop_notify(level, alert["title"], alert["message"] or alert["title"])
 
@@ -751,8 +769,21 @@ class Handler(BaseHTTPRequestHandler):
             level = text(data, "level")
             if not level:
                 raise ApiError(400, "level is required", levels=[l.name for l in system.config.levels])
+            duration = data.get("duration")
+            if duration is not None and (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not 0 <= duration <= HARD_CAP_SECONDS
+            ):
+                raise ApiError(400, f"duration must be a number of seconds from 0 to {HARD_CAP_SECONDS}")
             try:
-                result = system.sound(level, text(data, "message"), text(data, "title"), text(data, "source"))
+                result = system.sound(
+                    level,
+                    text(data, "message"),
+                    text(data, "title"),
+                    text(data, "source"),
+                    None if duration is None else float(duration),
+                )
             except KeyError:
                 raise ApiError(
                     404, f"unknown level {level!r}", levels=[l.name for l in system.config.levels]
@@ -927,6 +958,10 @@ def _duration(seconds: float) -> str:
     return f"{days}d{hours}h" if days else f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
 
 
+def _length(duration: float) -> str:
+    return "plays once" if not duration else f"sounds {duration:g}s"
+
+
 def _print_alert(alert: dict, now: float) -> None:
     level = _paint(f"{alert['level'].upper():<8}", alert.get("color"), bold=True)
     when = time.strftime("%H:%M:%S", time.localtime(alert["time"]))
@@ -944,10 +979,10 @@ def cli(args: argparse.Namespace) -> int:
 
     if args.command == "send":
         message = " ".join(args.message)
-        reply = client.post(
-            "/alert",
-            {"level": args.level, "message": message, "title": args.title or "", "source": args.source},
-        )
+        body = {"level": args.level, "message": message, "title": args.title or "", "source": args.source}
+        if args.duration is not None:
+            body["duration"] = args.duration
+        reply = client.post("/alert", body)
         if as_json:
             show(reply)
         else:
@@ -983,7 +1018,10 @@ def cli(args: argparse.Namespace) -> int:
             return 0
         for level in levels:
             ready = "" if level["sound_ready"] else _paint("  (sound not cached yet)", "#FF9966")
-            print(f"{_paint(level['name'].upper(), level['color'], True):<20} priority {level['priority']:<4} {level['style']}{ready}")
+            print(
+                f"{_paint(level['name'].upper(), level['color'], True):<20} priority {level['priority']:<4} "
+                f"{level['style']:<7} {_length(level['duration'])}{ready}"
+            )
             print(f"    {level['description']}")
         return 0
 
@@ -1025,7 +1063,7 @@ def cli(args: argparse.Namespace) -> int:
         for name in names:
             alert = client.post("/alert", {"level": name, "message": f"Test of the {name} alert", "source": "red-alert test"})["alert"]
             print(f"{_paint(name.upper(), alert['color'], True)}: {alert['status']}", flush=True)
-            deadline = time.time() + 30
+            deadline = time.time() + (alert.get("duration") or HARD_CAP_SECONDS) + 5
             while alert["status"] == "playing" and time.time() < deadline:
                 time.sleep(0.3)
                 playing = client.get("/health").get("playing")
@@ -1058,6 +1096,10 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("message", nargs="*")
     send.add_argument("--title", help="notification title (default: '<LEVEL> ALERT')")
     send.add_argument("--source", default=f"cli@{socket.gethostname()}", help="who is alerting")
+    send.add_argument(
+        "-d", "--duration", type=float, metavar="SECONDS",
+        help="sound for this long, looping or cutting the sound (0 = once; default: the level's)",
+    )
     send.add_argument("--json", action="store_true")
 
     for name, text in (("status", "show daemon status"), ("levels", "list alert levels")):

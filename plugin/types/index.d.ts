@@ -8,6 +8,8 @@ export type AlertLevel = {
   description: string
   color: string
   style: AlertStyle
+  /** How long it sounds, in seconds: cut or looped to fit; 0 plays the sound once. */
+  duration: number
   soundReady: boolean
 }
 
@@ -23,6 +25,8 @@ export type AlertRecord = {
   status: string
   /** Seconds since the epoch, the daemon's clock. */
   time: number
+  /** Seconds it sounds for; 0 plays the sound once. */
+  duration: number
 }
 
 /** What the last health check of the daemon found. */
@@ -42,7 +46,10 @@ export type DaemonLink = {
   levelsHash: string | null
 }
 
-/** The alert the band is showing: animating, then latched until acknowledged. */
+/** Who raised an alert: this session's Claude, the person by hand, or anyone else. */
+export type AlertOrigin = 'claude' | 'manual' | 'remote'
+
+/** The alert the band is showing: animating while it sounds, then latched until silenced. */
 export type ActiveAlert = {
   id: string
   level: string
@@ -51,12 +58,14 @@ export type ActiveAlert = {
   title: string
   message: string
   source: string
-  /** Raised by this session's Claude, not by another session or the CLI. */
-  isOwn: boolean
+  origin: AlertOrigin
+  /** Seconds the sound runs for; 0 when it plays once (its length unknown). */
+  duration: number
   /** Milliseconds since the epoch. */
   startedAt: number
+  /** The animation runs at least until then, and on while the sound plays. */
   animateUntil: number
-  /** Keeps the band lit after the animation until the person acknowledges it. */
+  /** Keeps the band lit after the animation until the person silences it. */
   isLatched: boolean
 }
 
@@ -67,6 +76,8 @@ declare module 'claude-code' {
       levels: AlertLevel[]
       history: AlertRecord[]
       active: ActiveAlert | null
+      /** The message typed into the console's manual-alert field. */
+      draft: string
     }
   }
 }

@@ -11,18 +11,32 @@ const TOOL = 'mcp__red-alert__alert'
 const NOW = 1_760_000_000_000
 
 const LEVELS = [
-  { name: 'normal', priority: 10, description: 'small things', color: '#99CCFF', style: 'sweep', sound_ready: true },
-  { name: 'yellow', priority: 50, description: 'big task done', color: '#FFCC33', style: 'pulse', sound_ready: true },
-  { name: 'red', priority: 90, description: 'blocked, need the user', color: '#FF3333', style: 'klaxon', sound_ready: true },
+  { name: 'normal', priority: 10, description: 'small things', color: '#99CCFF', style: 'sweep', duration: 0, sound_ready: true },
+  { name: 'yellow', priority: 50, description: 'big task done', color: '#FFCC33', style: 'pulse', duration: 0, sound_ready: true },
+  { name: 'red', priority: 90, description: 'blocked, need the user', color: '#FF3333', style: 'klaxon', duration: 12, sound_ready: true },
 ]
 
 type Request = { method: string; path: string; body: Record<string, unknown> }
+type FakeAlert = Record<string, unknown> & { id: string; status: string }
 
+/**
+ * A daemon in memory. The alert raised last plays until the test calls
+ * `finish()`, or until a `/stop` (or `stopElsewhere`) stops it.
+ */
 function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   const requests: Request[] = []
-  const alerts: Record<string, unknown>[] = []
+  const alerts: FakeAlert[] = []
   const registered: { name: string; description: string; inputSchema?: unknown }[] = []
   const toasts: string[] = []
+  let playing: FakeAlert | null = null
+
+  const stop = (id: string | undefined) => {
+    if (!playing || (id && playing.id !== id)) return null
+    playing.status = 'stopped'
+    const stopped = playing.id
+    playing = null
+    return stopped
+  }
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => {
@@ -36,6 +50,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   })
   on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
+  on('ui.focus', () => ({ deny: 'not holding the keys in a test' }))
   on('http.fetch', ($, e) => {
     if (options.isOnline === false) {
       return { deny: 'connect ECONNREFUSED 127.0.0.1:1701' }
@@ -56,7 +71,8 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
         return reply({
           ok: true, version: '0.1.0', hostname: 'bridge', time: NOW / 1000, uptime_s: 3600,
           player: 'auto (pw-play)', levels: LEVELS.map(l => l.name), levels_hash: 'abc123',
-          playing: null, mute: null, last_alert: alerts[0] ?? null,
+          playing: playing ? { id: playing.id, level: playing.level } : null, mute: null,
+          last_alert: alerts[0] ?? null,
         })
       case '/levels':
         return reply({ ok: true, levels: LEVELS })
@@ -65,22 +81,38 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
       case '/alert': {
         const level = LEVELS.find(l => l.name === body.level)
         if (!level) return reply({ ok: false, error: `unknown level '${body.level}'`, levels: LEVELS.map(l => l.name) }, 404)
-        const alert = {
+        if (playing) playing.status = 'preempted'
+        const alert: FakeAlert = {
           id: `a${alerts.length + 1}`, level: level.name, priority: level.priority, color: level.color,
           style: level.style, title: `${level.name.toUpperCase()} ALERT`, message: body.message ?? '',
-          source: body.source ?? '', time: NOW / 1000, status: 'playing', detail: null,
+          source: body.source ?? '', time: NOW / 1000, duration: body.duration ?? level.duration,
+          status: 'playing', detail: null,
         }
         alerts.unshift(alert)
+        playing = alert
         return reply({ ok: true, alert })
       }
       case '/stop':
-        return reply({ ok: true, stopped: body.id ?? null })
+        return reply({ ok: true, stopped: stop(typeof body.id === 'string' ? body.id : undefined) })
       default:
         return reply({ ok: true })
     }
   })
-  return { requests, alerts, registered, toasts }
+  return {
+    requests,
+    alerts,
+    registered,
+    toasts,
+    finish: () => {
+      if (playing) playing.status = 'played'
+      playing = null
+    },
+    stopElsewhere: () => stop(undefined),
+    sent: (path: string) => requests.filter(r => r.path === path),
+  }
 }
+
+const START = { cwd: '/home/u/project', surface: 'terminal', isInteractive: true } as const
 
 const BAND = {
   component: 'AbovePrompt',
@@ -100,7 +132,7 @@ describe('the alert tool', () => {
   test('is registered with the daemon levels and sounds an alert', async ($, on) => {
     mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on)
-    await $.session.start({ cwd: '/home/u/project', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
 
     const tool = daemon.registered[daemon.registered.length - 1]
     expect(tool?.name).toBe('alert')
@@ -109,14 +141,17 @@ describe('the alert tool', () => {
 
     const ran = await $.tool.call({ tool: TOOL, level: 'red', message: 'Need your decision on the schema' })
     expect(JSON.stringify(ran)).toContain('Sounded: RED alert is playing on bridge')
-    const sent = daemon.requests.find(r => r.path === '/alert')
-    expect(sent?.body).toEqual({ level: 'red', message: 'Need your decision on the schema', source: 'claude-code:project' })
+    expect(daemon.sent('/alert')[0]?.body).toEqual({
+      level: 'red',
+      message: 'Need your decision on the schema',
+      source: 'claude-code:project',
+    })
   })
 
   test('reports an unknown level with the valid ones', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on)
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
     const ran = await $.tool.call({ tool: TOOL, level: 'purple', message: 'x' })
     expect(JSON.stringify(ran)).toContain('Valid levels: normal, yellow, red')
   })
@@ -124,7 +159,7 @@ describe('the alert tool', () => {
   test('says so when the daemon is offline', async ($, on) => {
     mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on, { isOnline: false })
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
     expect(daemon.registered[0]?.description).toContain('- yellow:')
     const ran = await $.tool.call({ tool: TOOL, level: 'red', message: 'x' })
     expect(JSON.stringify(ran)).toContain('Offline: the alert system')
@@ -135,11 +170,13 @@ describe('the band', () => {
   test('shows the link status on every surface', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on)
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
       expect(await ui.find({ text: /ONLINE/ })).toBeDefined()
       expect(await ui.find({ text: /ALERT SYSTEM/ })).toBeDefined()
+      expect(await ui.find({ key: 'band:console' })).toBeDefined()
+      expect(await ui.find({ key: 'band:silence' })).toBeUndefined()
       await ui.unmount()
     }
   })
@@ -147,7 +184,7 @@ describe('the band', () => {
   test('shows OFFLINE with a Start button when the daemon is down', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on, { isOnline: false })
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
       expect(await ui.find({ text: /OFFLINE/ })).toBeDefined()
@@ -156,61 +193,147 @@ describe('the band', () => {
     }
   })
 
-  test('animates an alert, latches it, and acknowledges it', async ($, on) => {
+  test('animates for as long as the alert sounds, counting down, then latches', async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on)
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
-    await $.tool.call({ tool: TOOL, level: 'red', message: 'Blocked on credentials' })
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, level: 'red', message: 'Blocked on credentials' }) // red sounds 12 s
 
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
       expect(await ui.find({ text: /RED ALERT/ })).toBeDefined()
       expect(await ui.find({ text: /Blocked on credentials/ })).toBeDefined()
+      expect(await ui.find({ text: / 12s / })).toBeDefined()
+      expect((await ui.find({ key: 'band:silence' }))?.props.hotkey).toBe('0')
       if (surface === 'terminal') {
         expect(await ui.find({ key: 'bars:top' })).toBeDefined()
       }
       await ui.unmount()
     }
 
+    await clock.advance(9000) // 9 s of the 12
+    let ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ key: 'bars:top' })).toBeDefined()
+    expect(await ui.find({ text: / 3s / })).toBeDefined()
+    await ui.unmount()
+
+    await clock.advance(5000) // 14 s: the planned time is over, but the daemon still plays it
+    ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ key: 'bars:top' })).toBeDefined()
+    await ui.unmount()
+
+    daemon.finish()
     await clock.advance(1500)
-    await clock.advance(15000)
-    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
     expect(await ui.find({ key: 'bars:top' })).toBeUndefined()
     expect(await ui.find({ text: /RED ALERT/ })).toBeDefined()
-    await ui.press({ key: 'band:ack' })
-    expect(daemon.requests.some(r => r.path === '/stop' && r.body.id === 'a1')).toBe(true)
+    expect((await ui.find({ key: 'band:silence' }))?.text).toContain('Dismiss')
+    await ui.unmount()
+  })
+
+  test('0 silences the alert it shows', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, level: 'yellow', message: 'Refactor done' })
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    await ui.press({ key: 'band:silence' })
+    expect(daemon.sent('/stop').map(r => r.body)).toEqual([{ id: 'a1' }])
+    expect(daemon.alerts[0]?.status).toBe('stopped')
+    expect(await ui.find({ text: /YELLOW ALERT/ })).toBeUndefined()
     expect(await ui.find({ text: /ONLINE/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('takes the banner down when the alert is silenced elsewhere', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, level: 'red', message: 'Blocked' })
+    daemon.stopElsewhere()
+    await clock.advance(5000) // one health check
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ text: /RED ALERT/ })).toBeUndefined()
     await ui.unmount()
   })
 })
 
-describe('the console', () => {
-  test('draws levels and log, and tests a level', async ($, on) => {
+describe('sounding alerts by hand', () => {
+  test('/alert <level> [duration] [message]', async ($, on) => {
     mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on)
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
+
+    const red = await $.command.run({ command: 'alert', args: 'red 30s 开会了', ...TYPED })
+    expect(red.text).toBe('RED alert sounding (30s). Press 0 at an empty prompt to silence it.')
+    expect(daemon.sent('/alert')[0]?.body).toEqual({
+      level: 'red',
+      message: '开会了',
+      source: 'claude-code:project (manual)',
+      duration: 30,
+    })
+
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ text: /开会了  · manual/ })).toBeDefined()
+    await ui.unmount()
+
+    await $.command.run({ command: 'alert', args: 'sound normal 2m', ...TYPED })
+    expect(daemon.sent('/alert')[1]?.body).toEqual({
+      level: 'normal',
+      message: 'Manual normal alert',
+      source: 'claude-code:project (manual)',
+      duration: 120,
+    })
+
+    await $.command.run({ command: 'alert', args: 'yellow lunch is ready', ...TYPED })
+    expect(daemon.sent('/alert')[2]?.body.message).toBe('lunch is ready')
+    expect(daemon.sent('/alert')[2]?.body.duration).toBeUndefined()
+
+    const usage = await $.command.run({ command: 'alert', args: 'purple', ...TYPED })
+    expect(usage.text).toContain('levels: normal, yellow, red')
+
+    const stopped = await $.command.run({ command: 'alert', args: 'stop', ...TYPED })
+    expect(stopped.text).toBe('Alert silenced.')
+    expect(daemon.sent('/stop').map(r => r.body)).toEqual([{}])
+  })
+
+  test('the console sounds a level with the typed message', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...PANE })
       expect(await ui.find({ text: /GREEN · STANDING BY/ })).toBeDefined()
-      expect(await ui.find({ text: /big task done/ })).toBeDefined()
+      expect(await ui.find({ text: /MANUAL ALERT/ })).toBeDefined()
+      expect(await ui.find({ text: /klaxon 12s/ })).toBeDefined()
+      expect(await ui.find({ text: /pulse  once/ })).toBeDefined()
+      expect((await ui.find({ key: 'sound:red' }))?.props.hotkey).toBe('3')
       await ui.unmount()
     }
+
     const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...PANE })
-    await ui.press({ key: 'test:yellow' })
-    expect(daemon.requests.some(r => r.path === '/alert' && r.body.level === 'yellow')).toBe(true)
-    expect(await ui.find({ text: /YELLOW ALERT/ })).toBeDefined()
+    await ui.input({ key: 'manual:message', text: '午饭好了' })
+    await ui.press({ key: 'sound:red' })
+    expect(daemon.sent('/alert')[0]?.body).toEqual({
+      level: 'red',
+      message: '午饭好了',
+      source: 'claude-code:project (manual)',
+    })
+    expect(await ui.find({ text: /RED ALERT/ })).toBeDefined()
+    expect((await ui.find({ key: 'manual:message' }))?.props.value).toBe('')
+
+    await ui.press({ key: 'silence' })
+    expect(daemon.sent('/stop').map(r => r.body)).toEqual([{}])
+    expect(await ui.find({ text: /GREEN · STANDING BY/ })).toBeDefined()
     await ui.unmount()
   })
 
-  test('/alert subcommands answer', async ($, on) => {
+  test('/alert status lists the durations', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on)
-    await $.session.start({ cwd: '/p', surface: 'terminal', isInteractive: true })
+    await $.session.start(START)
     const status = await $.command.run({ command: 'alert', args: 'status', ...TYPED })
     expect(status.text).toContain('red-alert ● online at http://127.0.0.1:1701')
-    const tested = await $.command.run({ command: 'alert', args: 'test yellow', ...TYPED })
-    expect(tested.text).toBe('YELLOW test alert: playing.')
-    const usage = await $.command.run({ command: 'alert', args: 'bogus', ...TYPED })
-    expect(usage.text).toContain('Usage: /alert')
+    expect(status.text).toContain('normal (p10, once), yellow (p50, once), red (p90, 12s)')
   })
 })

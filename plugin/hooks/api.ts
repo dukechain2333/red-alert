@@ -14,6 +14,7 @@ export type DaemonAlert = {
   message: string
   source: string
   time: number
+  duration: number
   status: string
   detail: string | null
 }
@@ -38,6 +39,7 @@ export type DaemonLevel = {
   description: string
   color: string
   style: AlertStyle
+  duration: number
   sound_ready: boolean
 }
 

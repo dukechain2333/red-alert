@@ -9,7 +9,7 @@
       "name": "red-alert",
       "source": "./plugin",
       "description": "Claude sounds normal/yellow/red alerts on your machine's speakers; LCARS status band, alert animations and an /alert console.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "license": "MIT",
       "homepage": "https://github.com/dukechain2333/red-alert"
     }

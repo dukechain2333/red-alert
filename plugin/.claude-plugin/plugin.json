@@ -1,6 +1,6 @@
 {
   "name": "red-alert",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Audible alerts for Claude Code: Claude sounds normal/yellow/red alerts on your server's speakers, with an LCARS status band and alert animations.",
   "author": { "name": "dukechain2333" },
   "homepage": "https://github.com/dukechain2333/red-alert",

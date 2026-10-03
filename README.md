@@ -12,12 +12,14 @@ online and animates every alert in the terminal.
   levels and their "when to use" descriptions come from your config, so
   Claude picks among the levels you define.
 - **Any number of levels, any sounds.** Define levels in one TOML file: name,
-  sound (URL or file), priority, color, animation, volume and more.
+  sound (URL or file), how long it sounds (cut or looped to fit), priority,
+  color, animation, volume and more.
 - **Runs in the background.** A small Python daemon (standard library only)
   runs as a systemd user service and starts at boot.
 - **LCARS UI in Claude Code.** An online/offline status band above the
-  prompt, animated alert banners (klaxon, pulse, sweep), a console pane with
-  the alert log, and an `/alert` command.
+  prompt, animated alert banners (klaxon, pulse, sweep) that run for as long
+  as the alert sounds, a key to silence them (`0`), and a console pane and
+  `/alert` command for sounding alerts by hand.
 
 ```
 ┌───────────────────────── your server ─────────────────────────┐
@@ -33,11 +35,11 @@ online and animates every alert in the terminal.
 
 ## Default alert levels
 
-| Level | Sound | Claude uses it when… |
-| --- | --- | --- |
-| `normal` | [TNG communicator chirp](https://www.trekcore.com/audio/communicator/tng_chirp_clean.mp3) | a small milestone or FYI: a long build or test run finished, a progress checkpoint |
-| `yellow` | [computer alert](https://www.trekcore.com/audio/computer/alert09.mp3) | a significant body of work is complete and ready for review |
-| `red` | [TNG red alert klaxon](https://www.trekcore.com/audio/redalertandklaxons/tng_red_alert1.mp3) | it is blocked, needs a decision, credentials or approval, or something failed badly |
+| Level | Sound | Sounds for | Claude uses it when… |
+| --- | --- | --- | --- |
+| `normal` | [TNG communicator chirp](https://www.trekcore.com/audio/communicator/tng_chirp_clean.mp3) | once (0.5 s) | a small milestone or FYI: a long build or test run finished, a progress checkpoint |
+| `yellow` | [computer alert](https://www.trekcore.com/audio/computer/alert09.mp3) | once (2.3 s) | a significant body of work is complete and ready for review |
+| `red` | [TNG red alert klaxon](https://www.trekcore.com/audio/redalertandklaxons/tng_red_alert1.mp3) | 12 s (of 21 s) | it is blocked, needs a decision, credentials or approval, or something failed badly |
 
 ## Requirements
 
@@ -97,44 +99,54 @@ Start a new Claude Code session after installing. Then:
 - **The band above the prompt** shows the link status: `● ONLINE`,
   `○ OFFLINE` (with a **Start** button), or `◐ MUTED 25M` (with **Unmute**),
   plus your levels and the last alert. When an alert sounds, the band turns
-  into an animated banner:
+  into an animated banner that runs for as long as the sound plays, with a
+  countdown when the level has a `duration`:
   - **klaxon** (red): two rows of light bars above and below, with waves
     running outward from the center, and a banner that flashes with marching
     chevrons;
   - **pulse** (yellow): one bar above and below, and the panel breathes;
-  - **sweep** (normal): a scanner line passes once.
+  - **sweep** (normal): a scanner line runs across.
 
-  After the animation, a red or yellow alert that Claude raised in this
-  session stays lit until you acknowledge it: press **Acknowledge** (`a`
-  while the band is focused) or just type your next prompt. Either one also
-  stops a klaxon that is still sounding.
   Alerts raised elsewhere (another session, the CLI, a script) animate too,
   with their source shown, so every open session sees them.
-- **The alert console** (`/alert`) is a pane with the system status, your
-  levels (with **Test** buttons on hotkeys `1`–`9`) and the alert log.
-  Hotkeys: `s` stop sound, `m` mute 30 min, `u` unmute, `r` refresh,
-  `x` close.
-- **`/alert` subcommands:** `status`, `test [level]`, `stop`,
-  `mute [minutes]` (`0` = until unmuted), `unmute`, `start` (starts the
-  systemd service).
+- **Press `0` to silence an alert.** While a banner is up, typing `0` into
+  the empty prompt stops the sound and takes the banner down; you don't need
+  to focus anything first. (A bare digit at an empty prompt goes to the
+  band's buttons, as with Claude Code's own surveys; `0` in a message you are
+  typing is just a `0`.) After the sound ends, a red or yellow banner from
+  this session stays lit until you press `0` (now **Dismiss**). Typing your
+  next prompt also clears an alert that Claude raised, and silences it if
+  it's still sounding.
+- **Sound an alert by hand** with `/alert <level> [duration] [message]`:
+  `/alert red 30s Meeting in 5 minutes` sounds the red alert for 30 seconds
+  (`2m` works too), `/alert yellow` sounds yellow for its configured time.
+  `/alert` runs even while Claude is working.
+- **The alert console** (`/alert` with no arguments, or **Console** on the
+  band) has the system status, a **Manual alert** form and the alert log.
+  Type an optional message, press Enter, then the level's number (`1`–`9`)
+  to sound it. Other keys: `0` silence, `m` mute 30 min, `u` unmute,
+  `r` refresh, `x` close.
+- **Other `/alert` subcommands:** `status`, `stop`, `mute [minutes]` (`0` =
+  until unmuted), `unmute`, `start` (starts the systemd service).
 
 ```
 ▐ LCARS 1701 ▌ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ▐ ALERT CONDITION ▌
 
-SYSTEM     ● ONLINE  http://127.0.0.1:1701 · v0.1.0 · bridge · up 3h · auto (pw-play)
+SYSTEM     ● ONLINE  http://127.0.0.1:1701 · v0.2.0 · bridge · up 3h · auto (pw-play)
 CONDITION  GREEN · STANDING BY
 
-▐ LEVELS ▌ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1: Test ▐ NORMAL   ▌ p10  sweep  A light ping: a small milestone or an FYI…
-2: Test ▐ YELLOW   ▌ p50  pulse  A significant body of work is complete…
-3: Test ▐ RED      ▌ p90  klaxon The user is needed now: you are blocked…
+▐ MANUAL ALERT ▌ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Message  Lunch is ready_
+1: Sound ▐ NORMAL   ▌ p10  sweep  once  A light ping: a small milestone or an FYI…
+2: Sound ▐ YELLOW   ▌ p50  pulse  once  A significant body of work is complete…
+3: Sound ▐ RED      ▌ p90  klaxon 12s   The user is needed now: you are blocked…
 
 ▐ LOG ▌ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 21:04:11  RED     stopped    Need the prod DB password  · claude-code:shop
 20:51:37  YELLOW  played     Checkout refactor done, 214 tests pass  · claude-code:shop
 20:12:02  NORMAL  played     Nightly build finished  · cli@bridge
 
-[ Stop sound ] [ Mute 30m ] [ Unmute ] [ Refresh ] [ Close ]
+[ Silence ] [ Mute 30m ] [ Unmute ] [ Refresh ] [ Close ]
 ```
 
 ### Mod settings
@@ -163,12 +175,17 @@ sound = "~/sounds/fanfare.ogg"      # https:// URL or a file path
 style = "pulse"                     # sweep | pulse | klaxon
 color = "#33CC99"
 volume = 70                         # 0-100
-repeat = 2                          # play it twice
-max_seconds = 8                     # cut long sounds short (0 = no limit)
+duration = 8                        # sound for 8 s: cut a longer sound, loop a
+                                    # shorter one; 0 plays it once (the default)
 cooldown_seconds = 30               # ignore repeats within 30 s
 notify = true                       # also show a desktop notification
 description = "A deployment or release finished successfully."
 ```
+
+`duration` is how long the alert sounds, up to 300 seconds. A 21-second
+klaxon with `duration = 12` stops after 12 seconds; a 2-second doorbell with
+`duration = 6` rings three times. Leave it out (or set `0`) to play the sound
+once, in full. An alert raised by hand or through the API can override it.
 
 Claude reads each `description` to decide which level to use, so write it as
 advice on **when** to use the level. Overlapping alerts: a higher-priority
@@ -180,7 +197,7 @@ own command line) and `server.token`.
 ## CLI
 
 ```
-red-alert send LEVEL [MESSAGE...]   sound an alert (--title, --source, --json)
+red-alert send LEVEL [MESSAGE...]   sound an alert (-d SECONDS, --title, --source, --json)
 red-alert status                    is the daemon up? what is playing?
 red-alert levels                    the configured levels
 red-alert history [-n 20]           recent alerts

@@ -4,22 +4,28 @@
 //   levels and their descriptions read from the daemon (GET /levels);
 // - adds a short section to the system prompt saying when to use it;
 // - draws an LCARS strip above the prompt that shows whether the daemon is
-//   online, and animates every alert (klaxon, pulse or sweep) there;
-// - opens an alert console pane with /alert, and answers /alert subcommands.
+//   online, and animates every alert (klaxon, pulse or sweep) there for as
+//   long as it sounds; `0` at an empty prompt silences it;
+// - opens an alert console pane with /alert, where the person sounds alerts
+//   by hand, and answers /alert subcommands (`/alert red 30s message`).
 
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { ActiveAlert, AlertLevel, AlertRecord, DaemonLink } from '../types'
+import type { ActiveAlert, AlertLevel, AlertOrigin, AlertRecord, DaemonLink } from '../types'
 import { Offline, Refused, endpoint, errorText, parseReply, requestInit } from './api'
 import type { DaemonAlert, DaemonLevel, Health } from './api'
-import { DURATION_MS, FPS, LCARS, bannerColors, barCells, barRuns, chevrons, mix } from './frames'
+import { DURATION_MS, FPS, LCARS, bannerColors, barCells, barRuns, chevrons } from './frames'
 
 const TOOL_NAME = 'alert'
 const TOOL = 'mcp__red-alert__alert'
 const PANE = 'alert-console'
 const HISTORY_SIZE = 20
+const MAX_DURATION_S = 300
+/** Silences an alert: a bare digit typed into an empty prompt presses the band's Button for it. */
+const SILENCE_KEY = '0'
 const START_COMMAND = ['systemctl', '--user', 'start', 'red-alert']
+const SUBCOMMANDS = '[<level> [30s] [message] | status | stop | mute [minutes] | unmute | start]'
 /** Alert statuses worth a banner: the alert reached the speaker, or would have. */
 const SHOWN = new Set(['playing', 'played', 'muted', 'stopped', 'preempted'])
 
@@ -27,19 +33,20 @@ const link = atom({ plugin: 'red-alert', key: 'link' } as const, null)
 const levels = atom({ plugin: 'red-alert', key: 'levels' } as const, [])
 const history = atom({ plugin: 'red-alert', key: 'history' } as const, [])
 const active = atom({ plugin: 'red-alert', key: 'active' } as const, null)
+const draft = atom({ plugin: 'red-alert', key: 'draft' } as const, '')
 
 /** The tool's levels until the daemon has answered once. */
 const FALLBACK_LEVELS: AlertLevel[] = [
   {
-    name: 'normal', priority: 10, style: 'sweep', color: '#99CCFF', soundReady: false,
+    name: 'normal', priority: 10, style: 'sweep', color: '#99CCFF', duration: 0, soundReady: false,
     description: 'A light ping: a small milestone or FYI, such as a long build or test run that finished.',
   },
   {
-    name: 'yellow', priority: 50, style: 'pulse', color: '#FFCC33', soundReady: false,
+    name: 'yellow', priority: 50, style: 'pulse', color: '#FFCC33', duration: 0, soundReady: false,
     description: 'A significant body of work is complete and ready for review.',
   },
   {
-    name: 'red', priority: 90, style: 'klaxon', color: '#FF3333', soundReady: false,
+    name: 'red', priority: 90, style: 'klaxon', color: '#FF3333', duration: 12, soundReady: false,
     description: 'The user is needed now: you are blocked, need a decision, credentials or approval, or something failed badly.',
   },
 ]
@@ -66,6 +73,9 @@ let isPolling = false
 let isSeeded = false
 let pollTimer: Timer | undefined
 let frameTimer: Timer | undefined
+/** Once an animation's planned time is over: when the daemon was last asked, and its answer. */
+let soundCheckedAt = 0
+let isStillSounding = true
 const ownIds = new Set<string>()
 
 function settingsFrom(options: PluginOptions): Settings {
@@ -94,6 +104,7 @@ function toLevel(level: DaemonLevel): AlertLevel {
     description: level.description,
     color: level.color,
     style: level.style,
+    duration: level.duration ?? 0,
     soundReady: level.sound_ready,
   }
 }
@@ -109,6 +120,7 @@ function toRecord(alert: DaemonAlert): AlertRecord {
     source: alert.source,
     status: alert.status,
     time: alert.time,
+    duration: alert.duration ?? 0,
   }
 }
 
@@ -156,9 +168,21 @@ function clockText(epochSeconds: number): string {
   return [date.getHours(), date.getMinutes(), date.getSeconds()].map(n => String(n).padStart(2, '0')).join(':')
 }
 
+function lengthText(duration: number): string {
+  return duration > 0 ? `${Number(duration.toFixed(1))}s` : 'once'
+}
+
 function muteLabel(muted: DaemonLink['mute'], nowMs: number): string {
   if (!muted) return ''
   return muted.until === null ? 'MUTED' : `MUTED ${ago(muted.until - nowMs / 1000)}`
+}
+
+/** `30s`, `2m`, `1.5m` as seconds; undefined for anything else. */
+function parseDuration(word: string | undefined): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)(s|m)$/i.exec(word ?? '')
+  if (!match) return undefined
+  const seconds = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 60 : 1)
+  return Math.min(MAX_DURATION_S, seconds)
 }
 
 function outcome(alert: DaemonAlert, host: string): string {
@@ -178,6 +202,23 @@ function outcome(alert: DaemonAlert, host: string): string {
   }
 }
 
+function manualOutcome(alert: DaemonAlert): string {
+  const what = `${alert.level.toUpperCase()} alert`
+  switch (alert.status) {
+    case 'playing':
+    case 'played':
+      return `${what} sounding (${lengthText(alert.duration ?? 0)}). Press ${SILENCE_KEY} at an empty prompt to silence it.`
+    case 'muted':
+      return `${what} shown, but alerts are muted (/alert unmute).`
+    case 'cooldown':
+      return `${what} skipped: it sounded moments ago (cooldown).`
+    case 'suppressed':
+      return `${what} skipped: ${alert.detail ?? 'a higher-priority alert is playing'}.`
+    default:
+      return `${what} failed: ${alert.detail ?? alert.status}.`
+  }
+}
+
 function statusText(
   current: DaemonLink | null,
   list: readonly AlertLevel[],
@@ -190,7 +231,7 @@ function statusText(
   const last = log[0]
   return [
     `red-alert ● online at ${current.url} (v${current.version} on ${current.hostname}, player ${current.player})`,
-    `levels: ${list.map(level => `${level.name} (p${level.priority})`).join(', ')}`,
+    `levels: ${list.map(level => `${level.name} (p${level.priority}, ${lengthText(level.duration)})`).join(', ')}`,
     `muted: ${current.mute ? muteLabel(current.mute, now).toLowerCase() : 'no'}`,
     last
       ? `last: ${last.level} "${last.message || '-'}" ${last.status}, ${ago(now / 1000 - last.time).toLowerCase()} ago`
@@ -295,6 +336,13 @@ async function poll($: EngineInterface): Promise<void> {
     if (alerts.length > 0) {
       await update($, history, () => alerts.map(toRecord))
     }
+
+    // Silenced from elsewhere (another session, the CLI): take the banner down too.
+    const shown = await read($, active)
+    if (shown && alerts.some(alert => alert.id === shown.id && alert.status === 'stopped')) {
+      await clearBanner($, shown.id)
+    }
+
     const fresh = isSeeded
       ? alerts.find(alert => !known.has(alert.id) && !ownIds.has(alert.id) && SHOWN.has(alert.status))
       : undefined
@@ -302,7 +350,7 @@ async function poll($: EngineInterface): Promise<void> {
     if (fresh) {
       const from = fresh.source ? ` from ${fresh.source}` : ''
       $.ui.toast(`${fresh.title}${from}: ${fresh.message || fresh.level}`, { timeoutMs: 6000 })
-      await showAlert($, fresh, false)
+      await showAlert($, fresh, 'remote')
     }
   } catch (error) {
     $.ui.log(`red-alert: health check failed: ${errorText(error)}`, { to: 'debug' })
@@ -319,22 +367,52 @@ async function refresh($: EngineInterface): Promise<void> {
 // Alerts and their animation
 // ---------------------------------------------------------------------------
 
-async function raise($: EngineInterface, level: string, message: string, from: string): Promise<DaemonAlert> {
-  const { alert } = await call<{ alert: DaemonAlert }>($, 'POST', '/alert', { level, message, source: from })
-  ownIds.add(alert.id)
-  await update($, history, list => [toRecord(alert), ...list.filter(one => one.id !== alert.id)].slice(0, HISTORY_SIZE))
-  if (SHOWN.has(alert.status)) {
-    await showAlert($, alert, true)
+async function raise(
+  $: EngineInterface,
+  alert: { level: string; message: string; from: string; origin: AlertOrigin; duration?: number },
+): Promise<DaemonAlert> {
+  const body = {
+    level: alert.level,
+    message: alert.message,
+    source: alert.from,
+    ...(alert.duration === undefined ? {} : { duration: alert.duration }),
   }
-  return alert
+  const { alert: raised } = await call<{ alert: DaemonAlert }>($, 'POST', '/alert', body)
+  ownIds.add(raised.id)
+  await update($, history, list => [toRecord(raised), ...list.filter(one => one.id !== raised.id)].slice(0, HISTORY_SIZE))
+  if (SHOWN.has(raised.status)) {
+    await showAlert($, raised, alert.origin)
+  }
+  return raised
 }
 
-async function testLevel($: EngineInterface, level: string): Promise<void> {
-  await raise($, level, `Test of the ${level} alert`, `${source} (console)`).catch(() => null)
+/** Sounds a level by hand: from /alert, or a console button. */
+async function soundByHand($: EngineInterface, level: string, message: string, duration?: number): Promise<DaemonAlert> {
+  return raise($, {
+    level,
+    message: message || `Manual ${level} alert`,
+    from: `${source} (manual)`,
+    origin: 'manual',
+    duration,
+  })
 }
 
-async function showAlert($: EngineInterface, alert: DaemonAlert, isOwn: boolean): Promise<void> {
+/** A console Sound button: sounds `level` with the message typed into the console. */
+async function soundDraft($: EngineInterface, level: string): Promise<void> {
+  const message = (await read($, draft)).trim()
+  try {
+    const alert = await soundByHand($, level, message)
+    await update($, draft, () => '')
+    if (!SHOWN.has(alert.status)) $.ui.toast(manualOutcome(alert))
+  } catch (error) {
+    $.ui.toast(error instanceof Offline ? 'The alert system is offline.' : `red-alert: ${errorText(error)}`)
+  }
+}
+
+async function showAlert($: EngineInterface, alert: DaemonAlert, origin: AlertOrigin): Promise<void> {
   const now = await $.clock.now()
+  const isPlaying = alert.status === 'playing'
+  const duration = isPlaying ? (alert.duration ?? 0) : 0
   const shown: ActiveAlert = {
     id: alert.id,
     level: alert.level,
@@ -343,11 +421,14 @@ async function showAlert($: EngineInterface, alert: DaemonAlert, isOwn: boolean)
     title: alert.title,
     message: alert.message,
     source: alert.source,
-    isOwn,
+    origin,
+    duration,
     startedAt: now,
-    animateUntil: now + DURATION_MS[alert.style],
-    isLatched: isOwn && alert.style !== 'sweep',
+    animateUntil: now + (duration > 0 ? Math.max(2000, duration * 1000) : DURATION_MS[alert.style]),
+    isLatched: origin !== 'remote' && alert.style !== 'sweep',
   }
+  soundCheckedAt = 0
+  isStillSounding = isPlaying
   await update($, active, () => shown)
   animate($)
 }
@@ -357,10 +438,26 @@ function animate($: EngineInterface): void {
   frameTimer = $.clock.every(Math.round(1000 / FPS), () => void nextFrame($))
 }
 
-/** One animation frame: redraw, or settle the band once the animation is over. */
+/**
+ * Whether the daemon still plays `id`, asked at most once a second: a sound
+ * played once runs as long as its file, which the mod does not know.
+ */
+async function isSounding($: EngineInterface, id: string, now: number): Promise<boolean> {
+  if (now - soundCheckedAt >= 1000) {
+    soundCheckedAt = now
+    try {
+      isStillSounding = (await call<Health>($, 'GET', '/health')).playing?.id === id
+    } catch {
+      isStillSounding = false
+    }
+  }
+  return isStillSounding
+}
+
+/** One animation frame: redraw, or settle the band once the animation and the sound are over. */
 async function nextFrame($: EngineInterface): Promise<void> {
   const [now, current] = await Promise.all([$.clock.now(), read($, active)])
-  if (current && now < current.animateUntil) {
+  if (current && (now < current.animateUntil || (await isSounding($, current.id, now)))) {
     $.ui.invalidate('ui.render')
     return
   }
@@ -372,21 +469,27 @@ async function nextFrame($: EngineInterface): Promise<void> {
   $.ui.invalidate('ui.render')
 }
 
-/** Clears the banner; silences the sound when this session raised it. */
-async function acknowledge($: EngineInterface): Promise<void> {
-  const current = await read($, active)
-  if (!current) return
+async function clearBanner($: EngineInterface, id: string): Promise<void> {
   frameTimer?.cancel()
   frameTimer = undefined
-  await update($, active, shown => (shown?.id === current.id ? null : shown))
-  if (current.isOwn) {
-    await call($, 'POST', '/stop', { id: current.id }).catch(() => null)
-  }
+  await update($, active, shown => (shown?.id === id ? null : shown))
 }
 
-async function silence($: EngineInterface): Promise<string | null> {
-  await acknowledge($)
-  return (await call<{ stopped: string | null }>($, 'POST', '/stop', {})).stopped
+/**
+ * Takes the banner down and stops its sound; with `isEverything`, stops
+ * whatever the daemon is playing, banner or not.
+ */
+async function silence($: EngineInterface, isEverything = false): Promise<string | null> {
+  const current = await read($, active)
+  if (current) {
+    await clearBanner($, current.id)
+  }
+  const body = current && !isEverything ? { id: current.id } : {}
+  return (await call<{ stopped: string | null }>($, 'POST', '/stop', body)).stopped
+}
+
+async function silenceQuietly($: EngineInterface, isEverything = false): Promise<void> {
+  await silence($, isEverything).catch(() => null)
 }
 
 async function mute($: EngineInterface, minutes: number): Promise<void> {
@@ -417,6 +520,19 @@ async function startDaemon($: EngineInterface): Promise<string> {
 
 async function startAndToast($: EngineInterface): Promise<void> {
   $.ui.toast(await startDaemon($))
+}
+
+async function openConsole($: EngineInterface, isFocused: boolean): Promise<boolean> {
+  const opened = await $.ui.open({ id: PANE, title: 'Alert console', ...(isFocused ? { focus: true } : {}) })
+  return opened.isPlaced
+}
+
+/** After the message field's Enter: the ring moves to the levels, where a digit sounds one. */
+async function focusFirstSound($: EngineInterface): Promise<void> {
+  const [first] = [...(await read($, levels))].sort((a, b) => a.priority - b.priority)
+  if (first) {
+    await $.ui.focus({ requestId: PANE, key: `sound:${first.name}` }).catch(() => null)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +579,8 @@ function idleStrip(
   const isOffline = current !== null && current.checkedAt > 0 && !current.online
   const isMuted = Boolean(current?.mute)
 
-  let used = brand.length + 4 + 1 + 1 + status.label.length + 4 + (isOffline ? 10 : isMuted ? 11 : 0)
+  // the pills, gaps and buttons first; then the levels and the last alert, where room is left
+  let used = brand.length + 4 + 1 + 1 + status.label.length + 4 + 12 + (isOffline ? 10 : isMuted ? 11 : 0)
   const isLevelsShown = levelText !== '' && width - used - 4 >= levelText.length + 1
   if (isLevelsShown) used += levelText.length + 1
   const isLastShown = lastText !== '' && width - used - 4 >= lastText.length + 2
@@ -482,17 +599,19 @@ function idleStrip(
           <Text color={level.color} bold>{`${i > 0 ? ' · ' : ''}${level.name.toUpperCase()}`}</Text>
         ))}
       {isLastShown && <Text color={LCARS.tan}>{`  ${lastText}`}</Text>}
+      <Text> </Text>
+      <Button key="band:console" label="Console" hotkey="c" dimColor onPress={() => void openConsole($, true)} />
       {isOffline && <Button key="band:start" label="Start" hotkey="s" dimColor onPress={() => void startAndToast($)} />}
       {isMuted && <Button key="band:unmute" label="Unmute" hotkey="u" dimColor onPress={() => void unmute($).catch(() => null)} />}
     </Box>
   )
 }
 
-/** The alert banner, with animated light bars above and below while it is fresh. */
+/** The alert banner, with animated light bars above and below while it sounds. */
 function alertBanner($: EngineInterface, t: Table, width: number, maxRows: number, shown: ActiveAlert, now: number) {
   const { Box, Text, Button } = t
   const ms = now - shown.startedAt
-  const isAnimating = now < shown.animateUntil
+  const isAnimating = frameTimer !== undefined || now < shown.animateUntil
   const colors = bannerColors(shown.style, shown.color, ms, !isAnimating)
   const Raster = 'Raster' in t ? t.Raster : undefined
 
@@ -530,7 +649,9 @@ function alertBanner($: EngineInterface, t: Table, width: number, maxRows: numbe
       : shown.style === 'sweep'
         ? ` ◉ INCOMING · ${shown.title} `
         : ` ◆ ${shown.title} ◆ `
-  const from = shown.isOwn ? '' : `  · ${shown.source || 'elsewhere'}`
+  const from =
+    shown.origin === 'remote' ? `  · ${shown.source || 'elsewhere'}` : shown.origin === 'manual' ? '  · manual' : ''
+  const secondsLeft = shown.duration > 0 ? Math.ceil((shown.startedAt + shown.duration * 1000 - now) / 1000) : 0
 
   return (
     <Box flexDirection="column">
@@ -542,9 +663,17 @@ function alertBanner($: EngineInterface, t: Table, width: number, maxRows: numbe
             {` ${shown.message}${from} `}
           </Text>
         </Box>
-        {(shown.isOwn || !isAnimating) && (
-          <Button key="band:ack" label="Acknowledge" hotkey="a" onPress={() => void acknowledge($)} />
+        {secondsLeft > 0 && (
+          <Text backgroundColor={colors.background} color={colors.foreground}>{` ${secondsLeft}s `}</Text>
         )}
+        <Button
+          key="band:silence"
+          label={isAnimating ? 'Silence' : 'Dismiss'}
+          hotkey={SILENCE_KEY}
+          plain
+          onPress={() => void silenceQuietly($)}
+        />
+        <Text backgroundColor={colors.background}> </Text>
       </Box>
       {bars(bottom, 'bottom')}
     </Box>
@@ -586,15 +715,15 @@ export const register: Register = (on, options) => {
     source = `claude-code:${e.cwd.split('/').filter(Boolean).pop() ?? 'session'}`
     await $.command.register({
       name: 'alert',
-      description: 'Alert console: daemon status, test a level, stop, mute',
-      argumentHint: '[status | test <level> | stop | mute [minutes] | unmute | start]',
+      description: 'Alert console; sound an alert by hand, silence, mute, status',
+      argumentHint: SUBCOMMANDS,
+      immediate: true,
     })
     await registerTool($, await read($, levels))
     await Promise.race([poll($), $.clock.sleep(1500)])
     pollTimer?.cancel()
     pollTimer = $.clock.every(settings.pollMs, () => void refresh($))
-    const current = await read($, active)
-    if (current && (await $.clock.now()) < current.animateUntil) {
+    if (await read($, active)) {
       animate($)
     }
     return next(e)
@@ -606,11 +735,11 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The person is back at the keyboard: their alert has done its job.
+  // The person is back at the keyboard: Claude's alert has done its job.
   on('prompt.submit', async ($, e, next) => {
     const current = await read($, active)
-    if (current?.isOwn) {
-      await Promise.race([acknowledge($), $.clock.sleep(400)])
+    if (current?.origin === 'claude') {
+      await Promise.race([silenceQuietly($), $.clock.sleep(400)])
     }
     return next(e)
   })
@@ -629,7 +758,7 @@ export const register: Register = (on, options) => {
     const level = typeof e.level === 'string' ? e.level : ''
     const message = typeof e.message === 'string' ? e.message : ''
     try {
-      const alert = await raise($, level, message, source)
+      const alert = await raise($, { level, message, from: source, origin: 'claude' })
       const host = (await read($, link))?.hostname ?? 'this machine'
       return { result: outcome(alert, host) }
     } catch (error) {
@@ -657,7 +786,9 @@ export const register: Register = (on, options) => {
   on('classic.Notification', async ($, e, next) => {
     const level = settings.permissionPromptLevel
     if (level !== 'off' && e.notification_type === 'permission_prompt') {
-      await raise($, level, e.message, `${source} (permission prompt)`).catch(() => null)
+      await raise($, { level, message: e.message, from: `${source} (permission prompt)`, origin: 'claude' }).catch(
+        () => null,
+      )
     }
     return next(e)
   })
@@ -665,14 +796,15 @@ export const register: Register = (on, options) => {
   // -- /alert ----------------------------------------------------------------
 
   on('command.run', { command: 'alert' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
+    const words = e.args.trim().split(/\s+/).filter(Boolean)
+    const verb = (words[0] ?? '').toLowerCase()
     try {
-      switch (verb.toLowerCase()) {
+      switch (verb) {
         case '':
-        case 'console': {
-          const opened = await $.ui.open({ id: PANE, title: 'Alert console' })
-          return { text: opened.isPlaced ? 'Alert console opened.' : 'Alert console: widen the terminal to see it.' }
-        }
+        case 'console':
+          return {
+            text: (await openConsole($, false)) ? 'Alert console opened.' : 'Alert console: widen the terminal to see it.',
+          }
         case 'status': {
           await poll($)
           const [current, list, log, now] = await Promise.all([
@@ -683,19 +815,13 @@ export const register: Register = (on, options) => {
           ])
           return { text: statusText(current, list, log, now) }
         }
-        case 'test': {
-          const list = await read($, levels)
-          const name = rest[0] ?? list[list.length - 1]?.name ?? 'red'
-          const alert = await raise($, name, `Test of the ${name} alert`, `${source} (/alert test)`)
-          return { text: `${alert.level.toUpperCase()} test alert: ${alert.status}.` }
-        }
         case 'stop':
-        case 'ack': {
-          const stopped = await silence($)
+        case 'silence': {
+          const stopped = await silence($, true)
           return { text: stopped ? 'Alert silenced.' : 'Nothing was playing.' }
         }
         case 'mute': {
-          const minutes = rest[0] === undefined ? 30 : Number(rest[0])
+          const minutes = words[1] === undefined ? 30 : Number(words[1])
           if (!Number.isFinite(minutes) || minutes < 0) {
             return { text: 'Usage: /alert mute [minutes]  (0 = until /alert unmute)' }
           }
@@ -708,8 +834,19 @@ export const register: Register = (on, options) => {
         }
         case 'start':
           return { text: await startDaemon($) }
-        default:
-          return { text: 'Usage: /alert [status | test <level> | stop | mute [minutes] | unmute | start]' }
+        default: {
+          // `/alert <level> [30s] [message]`; also `/alert sound <level> ...` and `/alert test [level]`
+          const rest = verb === 'sound' || verb === 'test' ? words.slice(1) : words
+          const list = await read($, levels)
+          const level = (rest[0] ?? (verb === 'test' ? list[list.length - 1]?.name : undefined))?.toLowerCase()
+          if (!level || (list.length > 0 && !list.some(one => one.name === level))) {
+            const names = list.map(one => one.name).join(', ')
+            return { text: `Usage: /alert ${SUBCOMMANDS}${names ? `\nlevels: ${names}` : ''}` }
+          }
+          const duration = parseDuration(rest[1])
+          const message = rest.slice(duration === undefined ? 1 : 2).join(' ')
+          return { text: manualOutcome(await soundByHand($, level, message, duration)) }
+        }
       }
     } catch (error) {
       if (error instanceof Offline) {
@@ -736,7 +873,7 @@ export const register: Register = (on, options) => {
     ])
     const t = $.ui.resolve(e)
     const width = Math.max(20, e.props.bodyColumns)
-    if (shown && (now < shown.animateUntil || shown.isLatched)) {
+    if (shown) {
       return alertBanner($, t, width, Math.max(1, e.props.maxRows - 1), shown, now)
     }
     if (!settings.isIdleBandShown) return next(e)
@@ -744,17 +881,20 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const [current, shown, list, log, now] = await Promise.all([
+    const [current, shown, list, log, message, now] = await Promise.all([
       read($, link),
       read($, active),
       read($, levels),
       read($, history),
+      read($, draft),
       $.clock.now(),
     ])
     const t = $.ui.resolve(e)
     const { Box, Text, Button } = t
+    const Input = 'Input' in t ? t.Input : undefined
     const width = Math.max(30, e.props.bodyColumns)
     const rows = e.viewport?.rows ?? 30
+    const ordered = [...list].sort((a, b) => a.priority - b.priority)
 
     const condition = shown
       ? { label: `${shown.level.toUpperCase()} ALERT`, color: shown.color }
@@ -764,13 +904,11 @@ export const register: Register = (on, options) => {
     const system = current?.online
       ? `● ONLINE  ${current.url} · v${current.version} · ${current.hostname} · up ${ago(current.uptimeS ?? 0).toLowerCase()} · ${current.player}`
       : `○ OFFLINE  ${current?.url ?? settings.url}${current?.error ? ` · ${current.error}` : ''}`
-    const logRoom = Math.max(1, rows - list.length - 12)
+    const logRoom = Math.max(1, rows - ordered.length - 15)
 
     return (
       <Box flexDirection="column">
-        {shown && (now < shown.animateUntil || shown.isLatched)
-          ? alertBanner($, t, width, 5, shown, now)
-          : consoleHeader(t, width)}
+        {shown ? alertBanner($, t, width, 5, shown, now) : consoleHeader(t, width)}
         <Box flexDirection="row" marginTop={1}>
           <Text color={LCARS.sand} bold>{'SYSTEM     '}</Text>
           <Text color={current?.online ? LCARS.green : LCARS.red} wrap="truncate">{system}</Text>
@@ -781,21 +919,34 @@ export const register: Register = (on, options) => {
           {current?.mute && <Text color={LCARS.peach}>{`  · ${muteLabel(current.mute, now)}`}</Text>}
         </Box>
 
-        {section(t, width, 'LEVELS', LCARS.violet)}
-        {list.length === 0 && <Text dimColor>No levels yet: the daemon has not answered.</Text>}
-        {list.map((level, i) => (
+        {section(t, width, 'MANUAL ALERT', LCARS.violet)}
+        {Input && (
+          <Input
+            key="manual:message"
+            label="Message "
+            placeholder="optional; Enter, then a level's number"
+            value={message}
+            submitLabel="pick a level"
+            onInput={value => void update($, draft, () => value)}
+            onSubmit={value => void update($, draft, () => value).then(() => focusFirstSound($))}
+          />
+        )}
+        {ordered.length === 0 && <Text dimColor>No levels yet: the daemon has not answered.</Text>}
+        {ordered.map((level, i) => (
           <Box flexDirection="row">
             <Button
-              key={`test:${level.name}`}
-              label="Test"
+              key={`sound:${level.name}`}
+              label="Sound"
               {...(i < 9 ? { hotkey: String(i + 1) } : {})}
               plain
               dimColor
-              onPress={() => void testLevel($, level.name)}
+              onPress={() => void soundDraft($, level.name)}
             />
             <Text> </Text>
             {pill(t, level.name.toUpperCase().padEnd(8), level.color)}
-            <Text color={LCARS.tan}>{` p${String(level.priority).padEnd(4)}${level.style.padEnd(7)}`}</Text>
+            <Text color={LCARS.tan}>
+              {` p${String(level.priority).padEnd(4)}${level.style.padEnd(7)}${lengthText(level.duration).padEnd(6)}`}
+            </Text>
             <Box flexShrink={1}>
               <Text dimColor wrap="truncate">
                 {level.soundReady ? level.description : `(sound not cached yet) ${level.description}`}
@@ -818,7 +969,7 @@ export const register: Register = (on, options) => {
         ))}
 
         <Box flexDirection="row" marginTop={1} gap={1}>
-          <Button key="stop" label="Stop sound" hotkey="s" onPress={() => void silence($).catch(() => null)} />
+          <Button key="silence" label="Silence" hotkey={SILENCE_KEY} onPress={() => void silenceQuietly($, true)} />
           <Button key="mute" label="Mute 30m" hotkey="m" onPress={() => void mute($, 30).catch(() => null)} />
           <Button key="unmute" label="Unmute" hotkey="u" onPress={() => void unmute($).catch(() => null)} />
           {current !== null && current.checkedAt > 0 && !current.online && (

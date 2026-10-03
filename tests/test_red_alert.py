@@ -1,7 +1,7 @@
 """Tests for red_alert.py. Run: python3 -m unittest discover -s tests
 
-A fake player (a Python one-liner that sleeps) stands in for the speakers,
-so the tests make no sound.
+A fake player (a Python one-liner that counts its plays in `<sound>.plays`
+and sleeps 0.6 s) stands in for the speakers, so the tests make no sound.
 """
 
 from __future__ import annotations
@@ -21,7 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import red_alert as ca  # noqa: E402
 
-FAKE_PLAYER = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(0.6)' {{file}}"
+SOUND_SECONDS = 0.6
+FAKE_PLAYER = (
+    f"{shlex.quote(sys.executable)} -c "
+    f"'import sys, time; open(sys.argv[1] + \".plays\", \"a\").write(\"x\"); time.sleep({SOUND_SECONDS})' {{file}}"
+)
 
 
 def make_config(tmp: Path, token: str = "", **level_overrides) -> ca.Config:
@@ -31,7 +35,8 @@ def make_config(tmp: Path, token: str = "", **level_overrides) -> ca.Config:
         "server": {"host": "127.0.0.1", "port": 1, "token": token},
         "audio": {"player": FAKE_PLAYER, "cache_dir": str(tmp / "cache")},
         "levels": [
-            {"name": "normal", "priority": 10, "sound": "chirp.wav", "description": "small"},
+            {"name": "normal", "priority": 10, "sound": "chirp.wav", "description": "small",
+             "duration": 1.5},
             {"name": "yellow", "priority": 50, "sound": "alert.wav", "description": "done"},
             {"name": "red", "priority": 90, "sound": "klaxon.wav", "description": "help",
              **level_overrides},
@@ -64,6 +69,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_bad_levels(self):
         bad = [
+            {"levels": [{"name": "a", "sound": "x.wav", "duration": 301}]},
+            {"levels": [{"name": "a", "sound": "x.wav", "duration": -1}]},
             {"levels": []},
             {"levels": [{"name": "Bad Name", "sound": "x.wav"}]},
             {"levels": [{"name": "a", "sound": "x.wav"}, {"name": "a", "sound": "y.wav"}]},
@@ -75,6 +82,11 @@ class ConfigTests(unittest.TestCase):
         for raw in bad:
             with self.subTest(raw=raw), self.assertRaises(ca.ConfigError):
                 ca.parse_config(raw, None)
+
+    def test_legacy_keys_point_to_duration(self):
+        for key in ("repeat", "max_seconds"):
+            with self.subTest(key=key), self.assertRaisesRegex(ca.ConfigError, "replaced by `duration`"):
+                ca.parse_config({"levels": [{"name": "a", "sound": "x.wav", key: 2}]}, None)
 
     def test_custom_player_template(self):
         player = ca.Player("mpv --volume={volume} --gain={gain} {file}")
@@ -129,7 +141,41 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(len(health["levels_hash"]), 12)
         levels = self.client.get("/levels")["levels"]
         self.assertEqual(levels[2]["name"], "red")
+        self.assertEqual([level["duration"] for level in levels], [1.5, 0, 0])
         self.assertTrue(all(level["sound_ready"] for level in levels))
+
+    def plays(self, sound: str) -> int:
+        counter = Path(self.tmp.name) / f"{sound}.plays"
+        return len(counter.read_text()) if counter.exists() else 0
+
+    def timed(self, body: dict) -> tuple[dict, float]:
+        started = time.monotonic()
+        alert = self.client.post("/alert", body)["alert"]
+        return self.wait_for(alert["id"]), time.monotonic() - started
+
+    def test_duration_loops_a_shorter_sound(self):
+        alert, elapsed = self.timed({"level": "normal"})  # 1.5 s of a 0.6 s sound
+        self.assertEqual((alert["status"], alert["duration"]), ("played", 1.5))
+        self.assertEqual(self.plays("chirp.wav"), 3)  # 0.6 + 0.6 + 0.3 cut
+        self.assertGreaterEqual(elapsed, 1.4)
+        self.assertLess(elapsed, 2.4)
+
+    def test_duration_cuts_a_longer_sound(self):
+        alert, elapsed = self.timed({"level": "red", "duration": 0.25})
+        self.assertEqual((alert["status"], alert["duration"]), ("played", 0.25))
+        self.assertEqual(self.plays("klaxon.wav"), 1)
+        self.assertLess(elapsed, SOUND_SECONDS)
+
+    def test_zero_duration_plays_once(self):
+        alert, elapsed = self.timed({"level": "yellow"})
+        self.assertEqual((alert["status"], alert["duration"]), ("played", 0))
+        self.assertEqual(self.plays("alert.wav"), 1)
+        self.assertGreaterEqual(elapsed, SOUND_SECONDS - 0.1)
+
+    def test_duration_override_is_validated(self):
+        for duration in (-1, 301, "5", True):
+            with self.subTest(duration=duration), self.assertRaises(ca.ClientError):
+                self.client.post("/alert", {"level": "red", "duration": duration})
 
     def test_alert_plays_then_finishes(self):
         alert = self.client.post("/alert", {"level": "yellow", "message": "done  with\nit", "source": "t"})["alert"]
