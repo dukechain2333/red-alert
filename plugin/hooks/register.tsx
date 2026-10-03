@@ -22,6 +22,8 @@ const TOOL = 'mcp__red-alert__alert'
 const PANE = 'alert-console'
 const HISTORY_SIZE = 20
 const MAX_DURATION_S = 300
+/** A daemon call that takes longer counts as the daemon being offline. */
+const CALL_TIMEOUT_MS = 5000
 /** Silences an alert: a bare digit typed into an empty prompt presses the band's Button for it. */
 const SILENCE_KEY = '0'
 const START_COMMAND = ['systemctl', '--user', 'start', 'red-alert']
@@ -172,9 +174,17 @@ function lengthText(duration: number): string {
   return duration > 0 ? `${Number(duration.toFixed(1))}s` : 'once'
 }
 
+/** Time left, rounded up: a fresh 30-minute mute reads 30M, not 29M. */
+function left(seconds: number): string {
+  const s = Math.max(0, Math.ceil(seconds))
+  if (s < 60) return `${s}S`
+  const m = Math.ceil(s / 60)
+  return m < 60 ? `${m}M` : `${Math.floor(m / 60)}H${String(m % 60).padStart(2, '0')}M`
+}
+
 function muteLabel(muted: DaemonLink['mute'], nowMs: number): string {
   if (!muted) return ''
-  return muted.until === null ? 'MUTED' : `MUTED ${ago(muted.until - nowMs / 1000)}`
+  return muted.until === null ? 'MUTED' : `MUTED ${left(muted.until - nowMs / 1000)}`
 }
 
 /** `30s`, `2m`, `1.5m` as seconds; undefined for anything else. */
@@ -244,11 +254,21 @@ function statusText(
 // ---------------------------------------------------------------------------
 
 async function call<T>($: EngineInterface, method: 'GET' | 'POST', path: string, body?: object): Promise<T> {
+  // A daemon that takes the connection but never answers must not hang a poll or a tool call.
+  const wait = new AbortController()
+  const timedOut = $.clock.sleep(CALL_TIMEOUT_MS, { signal: wait.signal }).then(() => {
+    throw new Offline(`no answer in ${CALL_TIMEOUT_MS / 1000} s`)
+  })
   let response: Awaited<ReturnType<EngineInterface['http']['fetch']>>
   try {
-    response = await $.http.fetch(endpoint(settings.url, path), requestInit(method, body, settings.token))
+    response = await Promise.race([
+      $.http.fetch(endpoint(settings.url, path), requestInit(method, body, settings.token)),
+      timedOut,
+    ])
   } catch (error) {
-    throw new Offline(errorText(error))
+    throw error instanceof Offline ? error : new Offline(errorText(error))
+  } finally {
+    wait.abort()
   }
   return parseReply<T>(response, settings.url)
 }
@@ -456,11 +476,14 @@ async function isSounding($: EngineInterface, id: string, now: number): Promise<
 
 /** One animation frame: redraw, or settle the band once the animation and the sound are over. */
 async function nextFrame($: EngineInterface): Promise<void> {
+  const timer = frameTimer
   const [now, current] = await Promise.all([$.clock.now(), read($, active)])
   if (current && (now < current.animateUntil || (await isSounding($, current.id, now)))) {
     $.ui.invalidate('ui.render')
     return
   }
+  // Another alert took the band while the daemon answered: its own frames settle it.
+  if (frameTimer !== timer) return
   frameTimer?.cancel()
   frameTimer = undefined
   if (current && !current.isLatched) {
@@ -745,7 +768,12 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A /clear or /resume ends the conversation, not the process, and no
+  // session.start follows it: keep the band polling and any banner animating.
   on('session.end', ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      return next(e)
+    }
     pollTimer?.cancel()
     frameTimer?.cancel()
     return next(e)
