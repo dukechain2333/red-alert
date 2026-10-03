@@ -31,6 +31,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   const processes: string[][] = []
   let playing: FakeAlert | null = null
   let mute: { until: number | null } | null = null
+  let healthHeld: Promise<void> | null = null
 
   const stop = (id: string | undefined) => {
     if (!playing || (id && playing.id !== id)) return null
@@ -41,6 +42,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   }
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('tool.register', ($, e) => {
     registered.push(e)
     return { value: { tool: `mcp__red-alert__${e.name}` } }
@@ -57,7 +59,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
     processes.push([...e.argv])
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('http.fetch', ($, e) => {
+  on('http.fetch', async ($, e) => {
     if (options.isOnline === false) {
       return { deny: 'connect ECONNREFUSED 127.0.0.1:1701' }
     }
@@ -74,6 +76,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
     })
     switch (url.pathname) {
       case '/health':
+        await healthHeld
         return reply({
           ok: true, version: '0.1.0', hostname: 'bridge', time: NOW / 1000, uptime_s: 3600,
           player: 'auto (pw-play)', levels: LEVELS.map(l => l.name), levels_hash: 'abc123',
@@ -121,11 +124,22 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
       playing = null
     },
     stopElsewhere: () => stop(undefined),
+    /** Holds every /health answer until the returned function is called. */
+    holdHealth: () => {
+      let release = () => {}
+      healthHeld = new Promise(resolve => (release = resolve))
+      return () => {
+        healthHeld = null
+        release()
+      }
+    },
     sent: (path: string) => requests.filter(r => r.path === path),
   }
 }
 
 const START = { cwd: '/home/u/project', surface: 'terminal', isInteractive: true } as const
+
+const ending = (reason: 'clear' | 'resume' | 'prompt_input_exit') => ({ reason, sessionId: 's1', resume: { id: 's1' } })
 
 const BAND = {
   component: 'AbovePrompt',
@@ -238,6 +252,30 @@ describe('the band', () => {
     await ui.unmount()
   })
 
+  test('counts a mute down rounding up', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    fakeDaemon(on)
+    await $.session.start(START)
+    await $.command.run({ command: 'alert', args: 'mute 30', ...TYPED })
+    await clock.advance(3000)
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ text: /◐ MUTED 30M/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('shows OFFLINE when the daemon takes the request but never answers', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    const release = daemon.holdHealth()
+    await clock.advance(5000) // a poll asks, and hears nothing
+    await clock.advance(5000) // its call times out
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ text: /○ OFFLINE/ })).toBeDefined()
+    await ui.unmount()
+    release()
+  })
+
   test('animates for as long as the alert sounds, counting down, then latches', async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on)
@@ -290,6 +328,22 @@ describe('the band', () => {
     await ui.unmount()
   })
 
+  test('a new alert animates on when the last one settles under it', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, level: 'red', message: 'Blocked' }) // red sounds 12 s
+    const release = daemon.holdHealth()
+    await clock.advance(12_100) // its animation is over: a frame asks the daemon whether it still plays
+    await $.tool.call({ tool: TOOL, level: 'normal', message: 'Build finished' }) // a sweep: not latched
+    release() // the daemon answers: it plays the new alert, not the red one
+    daemon.finish()
+    await clock.advance(5000) // past the sweep
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    expect(await ui.find({ text: /NORMAL ALERT/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
   test('takes the banner down when the alert is silenced elsewhere', async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     const daemon = fakeDaemon(on)
@@ -300,6 +354,37 @@ describe('the band', () => {
     const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
     expect(await ui.find({ text: /RED ALERT/ })).toBeUndefined()
     await ui.unmount()
+  })
+})
+
+describe('session end', () => {
+  for (const reason of ['clear', 'resume'] as const) {
+    test(`a /${reason} keeps the band polling and the banner animating`, async ($, on) => {
+      const clock = mock.clock(on, { now: NOW })
+      const daemon = fakeDaemon(on)
+      await $.session.start(START)
+      await $.tool.call({ tool: TOOL, level: 'normal', message: 'Build finished' }) // a sweep: not latched
+      await $.session.end(ending(reason))
+
+      const polled = daemon.sent('/health').length
+      daemon.finish()
+      await clock.advance(5000) // past the sweep, and one poll
+      expect(daemon.sent('/health').length).toBeGreaterThan(polled)
+      const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+      expect(await ui.find({ text: /NORMAL ALERT/ })).toBeUndefined()
+      expect(await ui.find({ text: /ONLINE/ })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+
+  test('an exit stops polling', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    await $.session.end(ending('prompt_input_exit'))
+    const polled = daemon.sent('/health').length
+    await clock.advance(15000)
+    expect(daemon.sent('/health').length).toBe(polled)
   })
 })
 
