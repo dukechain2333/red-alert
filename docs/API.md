@@ -6,14 +6,17 @@ anything else that can send an HTTP request can raise alerts too.
 
 ## Conventions
 
-- Every response is JSON with `"ok": true` on success, or `"ok": false` and an
-  `"error"` message with a 4xx/5xx status.
+- Every route answers JSON with `"ok": true` on success, or `"ok": false` and
+  an `"error"` message with a 4xx/5xx status. A request the server cannot
+  parse, or a method other than `GET` and `POST`, gets the HTTP library's own
+  error page instead.
 - `POST` requests must send `Content-Type: application/json` (an empty body is
   fine where nothing is required). Requests carrying an `Origin` header are
   refused, so a web page in a browser cannot sound alarms through the API.
 - When `server.token` is set in the config, every `POST` and `GET /history`
   needs `Authorization: Bearer <token>`. `GET /health` and `GET /levels` stay
-  open so a client can always tell whether the daemon is up.
+  open so a client can always tell whether the daemon is up, but `/health`
+  leaves out `last_alert` (`null`) for a request without the token.
 
 ## `GET /health`
 
@@ -83,6 +86,11 @@ Only `level` is required. `message` is cut at 500 characters; `title`
 defaults to `<LEVEL> ALERT` and is used for the desktop notification.
 `duration` (seconds, 0 to 300) overrides the level's own for this alert.
 
+The reply comes at once. A sound URL not downloaded yet is fetched before it
+plays; the alert counts as `playing` meanwhile (it holds the speaker, and a
+`/stop` or `/mute` reaches it), and it `failed` if the download takes over 15
+seconds.
+
 ```json
 {
   "ok": true,
@@ -109,14 +117,14 @@ An unknown level is a `404` whose body lists the valid ones in `levels`.
 
 | status | meaning |
 | --- | --- |
-| `playing` | the sound is playing now |
+| `playing` | the sound is playing now, or downloading to play |
 | `played` | it played to the end, or for its `duration` |
 | `stopped` | someone stopped it (`POST /stop`; `0` in Claude Code) |
 | `preempted` | a higher- or equal-priority alert took over the speaker |
 | `suppressed` | not played: a higher-priority alert was playing |
 | `cooldown` | not played: the same level sounded within `cooldown_seconds` |
 | `muted` | not played: the daemon is muted (desktop notification still shown) |
-| `failed` | the sound could not be fetched or no player could play it; see `detail` |
+| `failed` | the sound could not be fetched or no player could play it; see `detail`. It does not start the cooldown |
 
 The status in the `POST /alert` response is the one at that moment; read
 `/history` for how it ended.
@@ -135,7 +143,7 @@ so one session cannot silence another session's alert by accident.
 ## `POST /mute` / `POST /unmute`
 
 `{"minutes": 30}` mutes for 30 minutes (the default), `{"minutes": 0}` until
-`/unmute`. Muting also stops the current sound. While muted, alerts are still
+`/unmute`; at most 525600 (a year). Muting also stops the current sound. While muted, alerts are still
 recorded, shown by the mod and sent as desktop notifications, but make no
 sound.
 

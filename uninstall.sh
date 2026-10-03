@@ -18,9 +18,15 @@ case "${1:-}" in
 esac
 
 if [ -f "$UNIT" ]; then
+  # Without your user manager (su, sudo -u, no login session) the service could
+  # not be stopped: removing its files would leave it running, then broken.
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "cannot reach your systemd user manager; run this from your own login session" >&2
+    exit 1
+  fi
   systemctl --user disable --now red-alert.service >/dev/null 2>&1 || true
   rm -f "$UNIT"
-  systemctl --user daemon-reload
+  systemctl --user daemon-reload || true
   echo "removed the service"
 fi
 rm -f "$BIN"
