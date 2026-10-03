@@ -96,11 +96,24 @@ Start a new Claude Code session after installing. Then:
   alerts today", "no alerts for this task") or edit the level descriptions.
   The tool never asks for permission, since all it does is play a sound on
   your own machine.
-- **The band above the prompt** shows the link status: `● ONLINE`,
-  `○ OFFLINE` (with a **Start** button), or `◐ MUTED 25M` (with **Unmute**),
-  plus your levels and the last alert. When an alert sounds, the band turns
-  into an animated banner that runs for as long as the sound plays, with a
-  countdown when the level has a `duration`:
+- **The band above the prompt** shows the alert system's state and your
+  levels: `● ONLINE  ● NORMAL  ● YELLOW  ● RED`, plus the last alert. It is
+  also a menu: press `ctrl+x tab` to step into the band (the cursor lands on
+  `ONLINE`), walk it with `←`/`→`, and press `Enter`:
+  - on **ONLINE**: mute every session (it turns into `◐ MUTED`); Enter on
+    `MUTED` unmutes. On `○ OFFLINE` it starts the daemon;
+  - on a **level**: sound that alert by hand, for the level's duration;
+  - on **Console**: open the alert console.
+
+  `Esc` takes you back to the prompt. The levels get no number keys here on
+  purpose: a bare digit typed into an empty prompt presses the band's
+  buttons, so you couldn't start a message with "1." without sounding an
+  alert. (`ctrl+x tab` is Claude Code's `abovePrompt:focus` action; rebind it
+  in `~/.claude/keybindings.json` if you like.)
+
+  When an alert sounds, the band turns into an animated banner that runs for
+  as long as the sound plays, with a countdown when the level has a
+  `duration`:
   - **klaxon** (red): two rows of light bars above and below, with waves
     running outward from the center, and a banner that flashes with marching
     chevrons;
@@ -121,7 +134,7 @@ Start a new Claude Code session after installing. Then:
   `/alert red 30s Meeting in 5 minutes` sounds the red alert for 30 seconds
   (`2m` works too), `/alert yellow` sounds yellow for its configured time.
   `/alert` runs even while Claude is working.
-- **The alert console** (`/alert` with no arguments, or **Console** on the
+- **The alert console** (`/alert` with no arguments, or **Console** in the
   band) has the system status, a **Manual alert** form and the alert log.
   Type an optional message, press Enter, then the level's number (`1`–`9`)
   to sound it. Other keys: `0` silence, `m` mute 30 min, `u` unmute,

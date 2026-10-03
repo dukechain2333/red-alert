@@ -28,7 +28,9 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   const alerts: FakeAlert[] = []
   const registered: { name: string; description: string; inputSchema?: unknown }[] = []
   const toasts: string[] = []
+  const processes: string[][] = []
   let playing: FakeAlert | null = null
+  let mute: { until: number | null } | null = null
 
   const stop = (id: string | undefined) => {
     if (!playing || (id && playing.id !== id)) return null
@@ -51,6 +53,10 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
   on('ui.focus', () => ({ deny: 'not holding the keys in a test' }))
+  on('process.run', ($, e) => {
+    processes.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   on('http.fetch', ($, e) => {
     if (options.isOnline === false) {
       return { deny: 'connect ECONNREFUSED 127.0.0.1:1701' }
@@ -71,7 +77,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
         return reply({
           ok: true, version: '0.1.0', hostname: 'bridge', time: NOW / 1000, uptime_s: 3600,
           player: 'auto (pw-play)', levels: LEVELS.map(l => l.name), levels_hash: 'abc123',
-          playing: playing ? { id: playing.id, level: playing.level } : null, mute: null,
+          playing: playing ? { id: playing.id, level: playing.level } : null, mute,
           last_alert: alerts[0] ?? null,
         })
       case '/levels':
@@ -94,6 +100,12 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
       }
       case '/stop':
         return reply({ ok: true, stopped: stop(typeof body.id === 'string' ? body.id : undefined) })
+      case '/mute':
+        mute = { until: body.minutes === 0 ? null : NOW / 1000 + Number(body.minutes) * 60 }
+        return reply({ ok: true, mute })
+      case '/unmute':
+        mute = null
+        return reply({ ok: true, mute })
       default:
         return reply({ ok: true })
     }
@@ -103,6 +115,7 @@ function fakeDaemon(on: On, options: { isOnline?: boolean } = {}) {
     alerts,
     registered,
     toasts,
+    processes,
     finish: () => {
       if (playing) playing.status = 'played'
       playing = null
@@ -167,30 +180,71 @@ describe('the alert tool', () => {
 })
 
 describe('the band', () => {
-  test('shows the link status on every surface', async ($, on) => {
+  test('lists the link and every level as items to press, on every surface', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on)
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
-      expect(await ui.find({ text: /ONLINE/ })).toBeDefined()
       expect(await ui.find({ text: /ALERT SYSTEM/ })).toBeDefined()
+      const items = ['band:link', 'band:level:normal', 'band:level:yellow', 'band:level:red']
+      const found = await Promise.all(items.map(key => ui.find({ key })))
+      expect(found.map(item => item?.text)).toEqual(['ONLINE', 'NORMAL', 'YELLOW', 'RED'])
+      expect(found[0]?.props.autoFocus).toBe(true)
+      // a bare digit at an empty prompt presses band Buttons: none of these may have one
+      expect(found.map(item => item?.props.hotkey)).toEqual([undefined, undefined, undefined, undefined])
       expect(await ui.find({ key: 'band:console' })).toBeDefined()
       expect(await ui.find({ key: 'band:silence' })).toBeUndefined()
       await ui.unmount()
     }
   })
 
-  test('shows OFFLINE with a Start button when the daemon is down', async ($, on) => {
+  test('Enter on the link item mutes and unmutes every session', async ($, on) => {
     mock.clock(on, { now: NOW })
-    fakeDaemon(on, { isOnline: false })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    await ui.press({ key: 'band:link' })
+    expect(daemon.sent('/mute').map(r => r.body)).toEqual([{ minutes: 0 }])
+    expect((await ui.find({ key: 'band:link' }))?.text).toBe('MUTED')
+    await ui.press({ key: 'band:link' })
+    expect(daemon.sent('/unmute')).toHaveLength(1)
+    expect((await ui.find({ key: 'band:link' }))?.text).toBe('ONLINE')
+    await ui.unmount()
+  })
+
+  test('Enter on a level item sounds it by hand', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on)
+    await $.session.start(START)
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    await ui.press({ key: 'band:level:yellow' })
+    expect(daemon.sent('/alert')[0]?.body).toEqual({
+      level: 'yellow',
+      message: 'Manual yellow alert',
+      source: 'claude-code:project (manual)',
+    })
+    expect(await ui.find({ text: /YELLOW ALERT/ })).toBeDefined()
+    expect(await ui.find({ key: 'band:level:yellow' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('shows OFFLINE, and Enter on it starts the daemon', async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const daemon = fakeDaemon(on, { isOnline: false })
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
-      expect(await ui.find({ text: /OFFLINE/ })).toBeDefined()
-      expect(await ui.find({ key: 'band:start' })).toBeDefined()
+      expect((await ui.find({ key: 'band:link' }))?.text).toBe('OFFLINE')
       await ui.unmount()
     }
+    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
+    const pressed = ui.press({ key: 'band:link' })
+    await clock.advance(1000) // the wait for the service to come up
+    await pressed
+    expect(daemon.processes).toEqual([['systemctl', '--user', 'start', 'red-alert']])
+    expect(daemon.toasts).toContain('Started, but it is not answering yet: see `journalctl --user -u red-alert`.')
+    await ui.unmount()
   })
 
   test('animates for as long as the alert sounds, counting down, then latches', async ($, on) => {
