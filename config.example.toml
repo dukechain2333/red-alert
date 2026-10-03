@@ -1,0 +1,93 @@
+# red-alert configuration
+#
+# Installed to ~/.config/red-alert/config.toml. After editing, apply it with
+#   red-alert reload        (or: systemctl --user reload red-alert)
+# Claude Code picks up added, removed or renamed levels on its own: the mod
+# rebuilds the alert tool from GET /levels.
+
+[server]
+host = "127.0.0.1"      # use "0.0.0.0" only together with a token
+port = 1701
+# token = "a-long-random-string"   # when set, POST /... and GET /history need
+#                                  # "Authorization: Bearer <token>"
+history_size = 200      # alerts kept in memory for /history
+
+[audio]
+# "auto" tries pw-play, paplay, ffplay, mpv, mpg123, afplay, aplay in that order
+# and remembers which one played each file type. Or name one of them, or give a
+# full command: "mpv --no-video --volume={volume} {file}"
+#   {file}   the sound file   {volume} 0-100   {gain} 0.00-1.00
+player = "auto"
+# cache_dir = "~/.cache/red-alert"   # where downloaded sounds are kept
+
+# ---------------------------------------------------------------------------
+# Alert levels. Define as many as you like; Claude chooses among them by
+# reading each `description`, so write it as advice on WHEN to use the level.
+#
+#   name              lowercase letters, digits, - and _          (required)
+#   sound             https:// URL (downloaded once) or a file path (required)
+#   priority          higher wins: a higher alert cuts off a lower one that is
+#                     still playing; a lower one is skipped while a higher plays
+#   description       when Claude should use this level
+#   style             animation in the Claude Code mod: sweep | pulse | klaxon
+#                     (default from priority: >=80 klaxon, >=40 pulse, else sweep)
+#   color             #RRGGBB used by the mod and the CLI
+#   volume            0-100                                       (default 100)
+#   repeat            play the sound this many times              (default 1)
+#   max_seconds       cut the sound after this long, 0 = no limit (default 0)
+#   cooldown_seconds  ignore repeats of this level within N seconds (default 0)
+#   notify            also show a desktop notification  (default priority>=40)
+# ---------------------------------------------------------------------------
+
+[[levels]]
+name = "normal"
+priority = 10
+sound = "https://www.trekcore.com/audio/communicator/tng_chirp_clean.mp3"
+style = "sweep"
+color = "#99CCFF"
+volume = 80
+cooldown_seconds = 20
+notify = false
+description = """
+A light ping: a small milestone or an FYI the user may want to glance at, \
+such as a long build, download or test run that finished, or a progress \
+checkpoint partway through a long autonomous task. Never use it for \
+something that needs a reply."""
+
+[[levels]]
+name = "yellow"
+priority = 50
+sound = "https://www.trekcore.com/audio/computer/alert09.mp3"
+style = "pulse"
+color = "#FFCC33"
+volume = 90
+cooldown_seconds = 10
+description = """
+A significant body of work is complete and ready for review: a multi-step \
+task or feature finished, a large refactor done with tests passing, or a \
+long investigation concluded. Use it when you finish a big task and hand \
+control back to the user without needing anything urgent from them."""
+
+[[levels]]
+name = "red"
+priority = 90
+sound = "https://www.trekcore.com/audio/redalertandklaxons/tng_red_alert1.mp3"
+style = "klaxon"
+color = "#FF3333"
+volume = 100
+max_seconds = 12
+description = """
+The user is needed now: you are blocked or stuck and cannot make progress \
+on your own; you need a decision, credentials, approval or information only \
+they have; something failed badly or a destructive or irreversible step is \
+waiting for confirmation. Raise it right before you stop to ask."""
+
+# Example of a custom level:
+#
+# [[levels]]
+# name = "blue"
+# priority = 30
+# sound = "~/sounds/doorbell.wav"
+# style = "sweep"
+# color = "#6699FF"
+# description = "A deployment or release finished successfully."

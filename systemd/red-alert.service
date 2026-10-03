@@ -1,0 +1,22 @@
+# systemd user unit for the red-alert daemon. install.sh fills in @PYTHON@ and
+# @PREFIX@ and installs it to ~/.config/systemd/user/red-alert.service.
+#
+# It runs in your user session so it can reach your sound server (PipeWire or
+# PulseAudio); `loginctl enable-linger` starts that session at boot.
+
+[Unit]
+Description=red-alert: audible alerts for Claude Code
+Documentation=https://github.com/dukechain2333/red-alert
+After=pipewire.service pipewire-pulse.service pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ @PREFIX@/red_alert.py serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# written by /plugin-types for type-checking the mod; regenerate per build
+plugin/.claude/
+node_modules/
+# downloaded sounds are never committed
+*.mp3
+*.wav
+*.ogg

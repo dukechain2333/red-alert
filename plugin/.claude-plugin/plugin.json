@@ -1,0 +1,44 @@
+{
+  "name": "red-alert",
+  "version": "0.1.0",
+  "description": "Audible alerts for Claude Code: Claude sounds normal/yellow/red alerts on your server's speakers, with an LCARS status band and alert animations.",
+  "author": { "name": "dukechain2333" },
+  "homepage": "https://github.com/dukechain2333/red-alert",
+  "repository": "https://github.com/dukechain2333/red-alert",
+  "license": "MIT",
+  "keywords": ["alert", "notification", "sound", "mod", "lcars"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "url": {
+      "type": "string",
+      "title": "Daemon URL",
+      "description": "Where the red-alert daemon listens.",
+      "default": "http://127.0.0.1:1701"
+    },
+    "token": {
+      "type": "string",
+      "title": "Daemon token",
+      "description": "The daemon's server.token, if you set one.",
+      "default": "",
+      "sensitive": true
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Health check interval (seconds)",
+      "description": "How often the band checks whether the daemon is online and picks up alerts raised elsewhere.",
+      "default": 5
+    },
+    "permissionPromptLevel": {
+      "type": "string",
+      "title": "Alert on permission prompts",
+      "description": "Sound this level whenever Claude Code waits on a permission prompt, or 'off'.",
+      "default": "off"
+    },
+    "idleBand": {
+      "type": "boolean",
+      "title": "Show the status band",
+      "description": "Show the LCARS status strip above the prompt while no alert is up. Alerts always animate there.",
+      "default": true
+    }
+  }
+}

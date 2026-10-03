@@ -1,0 +1,17 @@
+{
+  "name": "red-alert",
+  "owner": { "name": "dukechain2333" },
+  "metadata": {
+    "description": "Audible alerts for Claude Code: a speaker daemon plus a mod with an LCARS status band and alert animations."
+  },
+  "plugins": [
+    {
+      "name": "red-alert",
+      "source": "./plugin",
+      "description": "Claude sounds normal/yellow/red alerts on your machine's speakers; LCARS status band, alert animations and an /alert console.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/dukechain2333/red-alert"
+    }
+  ]
+}
