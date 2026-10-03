@@ -522,26 +522,6 @@ async function startAndToast($: EngineInterface): Promise<void> {
   $.ui.toast(await startDaemon($))
 }
 
-/** The band's link item: mutes or unmutes every session while the daemon answers, starts it while it does not. */
-async function toggleLink($: EngineInterface): Promise<void> {
-  const current = await read($, link)
-  try {
-    if (!current || current.checkedAt === 0) {
-      await refresh($)
-    } else if (!current.online) {
-      await startAndToast($)
-    } else if (current.mute) {
-      await unmute($)
-      $.ui.toast('Alerts unmuted.')
-    } else {
-      await mute($, 0)
-      $.ui.toast('Alerts muted in every session; Enter on MUTED unmutes them.')
-    }
-  } catch (error) {
-    $.ui.toast(error instanceof Offline ? 'The alert system is offline.' : `red-alert: ${errorText(error)}`)
-  }
-}
-
 /** A level item on the band: sounds that alert by hand, for the level's own duration. */
 async function soundFromBand($: EngineInterface, level: string): Promise<void> {
   try {
@@ -583,20 +563,19 @@ function rule(t: Table, width: number, color: string) {
   return <Text color={color}>{'━'.repeat(Math.max(1, width))}</Text>
 }
 
-/** The link item: its mark, label and color for the daemon's state. */
-function linkState(current: DaemonLink | null, now: number): { mark: string; label: string; color: string } {
-  if (!current || current.checkedAt === 0) return { mark: '◌', label: 'LINKING', color: LCARS.tan }
-  if (!current.online) return { mark: '○', label: 'OFFLINE', color: LCARS.red }
-  if (current.mute) return { mark: '◐', label: muteLabel(current.mute, now), color: LCARS.peach }
-  return { mark: '●', label: 'ONLINE', color: LCARS.green }
+function statusPill(current: DaemonLink | null, now: number): { label: string; color: string } {
+  if (!current || current.checkedAt === 0) return { label: '◌ LINKING', color: LCARS.tan }
+  if (!current.online) return { label: '○ OFFLINE', color: LCARS.red }
+  if (current.mute) return { label: `◐ ${muteLabel(current.mute, now)}`, color: LCARS.peach }
+  return { label: '● ONLINE', color: LCARS.green }
 }
 
 /**
- * The strip shown while no alert is up. Its items are Buttons the person
- * reaches with the band's focus (ctrl+x tab), walks with ←/→ and presses
- * with Enter: the link item mutes, unmutes or starts the daemon, a level
- * sounds that alert. No digit hotkeys here: a bare digit at an empty prompt
- * would press them while the person starts a message.
+ * The strip shown while no alert is up: the daemon's state, then the levels
+ * as Buttons the person reaches with the band's focus (ctrl+x tab), walks
+ * with ←/→ and presses with Enter to sound that alert by hand. No digit
+ * hotkeys: a bare digit at an empty prompt would press them while the
+ * person starts a message.
  */
 function idleStrip(
   $: EngineInterface,
@@ -608,22 +587,11 @@ function idleStrip(
   now: number,
 ) {
   const { Box, Text, Button } = t
-  const state = linkState(current, now)
-  const items = [
-    { key: 'band:link', ...state, onPress: () => void toggleLink($) },
-    ...list.map(level => ({
-      key: `band:level:${level.name}`,
-      mark: '●',
-      label: level.name.toUpperCase(),
-      color: level.color,
-      onPress: () => void soundFromBand($, level.name),
-    })),
-  ]
-  const console = 'Console'
+  const status = statusPill(current, now)
 
-  // the items and the console button first; then the brand, the rule and the last alert where room is left
-  const itemsWidth = items.reduce((n, item) => n + item.label.length + 2, 0) + 2 * (items.length - 1)
-  const fixed = 1 + 1 + itemsWidth + 1 + console.length
+  // the status and the levels first; then the brand, the rule and the last alert where room is left
+  const levelsWidth = list.reduce((n, level) => n + level.name.length + 2, 0) + 2 * Math.max(0, list.length - 1)
+  const fixed = 1 + 1 + status.label.length + 4 + (list.length > 0 ? 2 + levelsWidth : 0)
   const brand = width - fixed - 18 >= 4 ? '◉ ALERT SYSTEM' : '◉'
   let used = brand.length + 4 + fixed
   const last = log[0]
@@ -637,14 +605,20 @@ function idleStrip(
       <Text> </Text>
       {rule(t, width - used, LCARS.lavender)}
       <Text> </Text>
-      {items.map((item, i) => [
+      {pill(t, status.label, status.color)}
+      {list.length > 0 && <Text>  </Text>}
+      {list.map((level, i) => [
         i > 0 ? <Text>  </Text> : null,
-        <Text color={item.color} bold>{`${item.mark} `}</Text>,
-        <Button key={item.key} label={item.label} plain {...(i === 0 ? { autoFocus: true } : {})} onPress={item.onPress} />,
+        <Text color={level.color} bold>● </Text>,
+        <Button
+          key={`band:level:${level.name}`}
+          label={level.name.toUpperCase()}
+          plain
+          {...(i === 0 ? { autoFocus: true } : {})}
+          onPress={() => void soundFromBand($, level.name)}
+        />,
       ])}
       {isLastShown && <Text color={LCARS.tan}>{`  ${lastText}`}</Text>}
-      <Text> </Text>
-      <Button key="band:console" label={console} plain dimColor onPress={() => void openConsole($, true)} />
     </Box>
   )
 }
@@ -914,7 +888,8 @@ export const register: Register = (on, options) => {
       $.clock.now(),
     ])
     const t = $.ui.resolve(e)
-    const width = Math.max(20, e.props.bodyColumns)
+    // the engine draws its own collapse mark, ` [-]`, at the band's right edge
+    const width = Math.max(20, e.props.bodyColumns - 4)
     if (shown) {
       return alertBanner($, t, width, Math.max(1, e.props.maxRows - 1), shown, now)
     }

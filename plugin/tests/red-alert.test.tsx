@@ -180,37 +180,24 @@ describe('the alert tool', () => {
 })
 
 describe('the band', () => {
-  test('lists the link and every level as items to press, on every surface', async ($, on) => {
+  test('shows the daemon state, and the levels as the only items to press', async ($, on) => {
     mock.clock(on, { now: NOW })
     fakeDaemon(on)
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
       expect(await ui.find({ text: /ALERT SYSTEM/ })).toBeDefined()
-      const items = ['band:link', 'band:level:normal', 'band:level:yellow', 'band:level:red']
-      const found = await Promise.all(items.map(key => ui.find({ key })))
-      expect(found.map(item => item?.text)).toEqual(['ONLINE', 'NORMAL', 'YELLOW', 'RED'])
-      expect(found[0]?.props.autoFocus).toBe(true)
+      expect(await ui.find({ text: /● ONLINE/ })).toBeDefined()
+      const keys = ['band:level:normal', 'band:level:yellow', 'band:level:red']
+      const items = await Promise.all(keys.map(key => ui.find({ key })))
+      expect(items.map(item => item?.text)).toEqual(['NORMAL', 'YELLOW', 'RED'])
+      expect(items.map(item => item?.props.autoFocus)).toEqual([true, undefined, undefined])
       // a bare digit at an empty prompt presses band Buttons: none of these may have one
-      expect(found.map(item => item?.props.hotkey)).toEqual([undefined, undefined, undefined, undefined])
-      expect(await ui.find({ key: 'band:console' })).toBeDefined()
-      expect(await ui.find({ key: 'band:silence' })).toBeUndefined()
+      expect(items.map(item => item?.props.hotkey)).toEqual([undefined, undefined, undefined])
+      const buttons = await ui.findAll({ type: 'Button' })
+      expect(buttons.map(button => button.key)).toEqual(keys)
       await ui.unmount()
     }
-  })
-
-  test('Enter on the link item mutes and unmutes every session', async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const daemon = fakeDaemon(on)
-    await $.session.start(START)
-    const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
-    await ui.press({ key: 'band:link' })
-    expect(daemon.sent('/mute').map(r => r.body)).toEqual([{ minutes: 0 }])
-    expect((await ui.find({ key: 'band:link' }))?.text).toBe('MUTED')
-    await ui.press({ key: 'band:link' })
-    expect(daemon.sent('/unmute')).toHaveLength(1)
-    expect((await ui.find({ key: 'band:link' }))?.text).toBe('ONLINE')
-    await ui.unmount()
   })
 
   test('Enter on a level item sounds it by hand', async ($, on) => {
@@ -229,21 +216,24 @@ describe('the band', () => {
     await ui.unmount()
   })
 
-  test('shows OFFLINE, and Enter on it starts the daemon', async ($, on) => {
-    const clock = mock.clock(on, { now: NOW })
-    const daemon = fakeDaemon(on, { isOnline: false })
+  test('shows OFFLINE when the daemon is down', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    fakeDaemon(on, { isOnline: false })
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'red-alert', surface, ...BAND })
-      expect((await ui.find({ key: 'band:link' }))?.text).toBe('OFFLINE')
+      expect(await ui.find({ text: /○ OFFLINE/ })).toBeDefined()
       await ui.unmount()
     }
+  })
+
+  test('shows MUTED with the time left', async ($, on) => {
+    mock.clock(on, { now: NOW })
+    fakeDaemon(on)
+    await $.session.start(START)
+    await $.command.run({ command: 'alert', args: 'mute 30', ...TYPED })
     const ui = await $.ui.mount({ plugin: 'red-alert', surface: 'terminal', ...BAND })
-    const pressed = ui.press({ key: 'band:link' })
-    await clock.advance(1000) // the wait for the service to come up
-    await pressed
-    expect(daemon.processes).toEqual([['systemctl', '--user', 'start', 'red-alert']])
-    expect(daemon.toasts).toContain('Started, but it is not answering yet: see `journalctl --user -u red-alert`.')
+    expect(await ui.find({ text: /◐ MUTED 30M/ })).toBeDefined()
     await ui.unmount()
   })
 
